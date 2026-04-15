@@ -69,9 +69,9 @@ MAX_PARTIAL_SECONDS = 8
 INTERIM_INTERVAL_S = 1.0
 
 # How many seconds of audio to feed to detect_language().
-# 1.5 s is enough for reliable detection on most languages and gets the
-# first detection result well before 3 s of speech elapses.
-DETECT_SECONDS = 1.5
+# 1.0 s is enough for reliable detection and gets the first detection result
+# before 2 s of speech elapses, unblocking partials sooner.
+DETECT_SECONDS = 1.0
 
 # How many seconds of continuous silence before the cached detected language
 # is discarded.  This ensures that a long pause between speakers (e.g. video
@@ -82,7 +82,9 @@ SILENCE_LANG_RESET_S = 3.0
 # VAD tuning
 # ---------------------------------------------------------------------------
 VAD_THRESHOLD = 0.3
-VAD_MIN_SILENCE_MS = 700
+# 400 ms gives faster sentence boundaries for Japanese and other languages
+# with short inter-sentence pauses.  700 ms was too sluggish.
+VAD_MIN_SILENCE_MS = 400
 VAD_SPEECH_PAD_MS = 100
 
 ResultCallback = Callable[[str, str, Optional[float]], None]
@@ -533,15 +535,16 @@ class Transcriber:
             logger.debug("Partial skipped — silence (rms too low).")
             return
         if lang is None:
-            logger.debug("Partial skipped — lang not yet detected.")
-            return
+            logger.debug(
+                "Partial — lang not yet detected, letting Whisper auto-detect."
+            )
 
         audio = _normalize_audio(audio, rms)
         try:
             result = model.transcribe(
                 audio,
                 task="transcribe",
-                language=lang,
+                language=lang,  # None → Whisper auto-detects
                 fp16=self.device != "cpu",
                 temperature=(0.0, 0.2),
                 beam_size=1,
@@ -555,6 +558,8 @@ class Transcriber:
             logger.error("Partial transcription error: %s", exc, exc_info=True)
             return
 
+        # Use Whisper's detected language if we didn't have one.
+        result_lang: str = str(result.get("language") or lang or "?")
         text: str = str(result.get("text", "")).strip()
         if text:
             if _is_repetition_loop(text):
@@ -563,7 +568,7 @@ class Transcriber:
                 )
                 return
             logger.debug("Partial: %s", text[:80])
-            self.on_partial(lang, text, self._detected_confidence)
+            self.on_partial(result_lang, text, self._detected_confidence)
         else:
             logger.debug(
                 "Partial returned empty (raw=%r).", str(result.get("text", ""))[:40]
@@ -984,24 +989,22 @@ class Transcriber:
                 if now - _last_interim_time >= INTERIM_INTERVAL_S:
                     _last_interim_time = now
                     lang = self._vad_lang  # GIL-atomic read
-                    if lang is not None:
-                        speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
-                        audio = np.concatenate(speech_chunks)
-                        max_samples = int(MAX_PARTIAL_SECONDS * WHISPER_RATE)
-                        if len(audio) > max_samples:
-                            audio = audio[-max_samples:]
-                        self._infer_queue.put(("partial", audio, lang))
-                        logger.debug(
-                            "VAD — queued partial (elapsed=%.1fs, samples=%d, lang=%s).",
-                            now - _utterance_start_time,
-                            len(audio),
-                            lang,
-                        )
-                    else:
-                        logger.debug(
-                            "Partial skipped — lang not yet detected (elapsed=%.1fs).",
-                            now - _utterance_start_time,
-                        )
+                    # Pass lang=None when detection hasn't finished yet —
+                    # Whisper will auto-detect on the partial pass, giving
+                    # the user visible text within INTERIM_INTERVAL_S of
+                    # speech start instead of waiting for a confirmed language.
+                    speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
+                    audio = np.concatenate(speech_chunks)
+                    max_samples = int(MAX_PARTIAL_SECONDS * WHISPER_RATE)
+                    if len(audio) > max_samples:
+                        audio = audio[-max_samples:]
+                    self._infer_queue.put(("partial", audio, lang))
+                    logger.debug(
+                        "VAD — queued partial (elapsed=%.1fs, samples=%d, lang=%s).",
+                        now - _utterance_start_time,
+                        len(audio),
+                        lang,
+                    )
 
             # ── Safety cap (wall-clock) ─────────────────────────────────
             if (
