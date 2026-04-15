@@ -1,0 +1,31 @@
+[project]
+name = "polyglot"
+version = "0.1.0"
+description = "Real-time multilingual transcription and translation TUI"
+requires-python = ">=3.14"
+dependencies = [
+    "argostranslate>=1.11.0",
+    "deep-translator>=1.11.4",
+    "sounddevice>=0.5.5",
+]
+
+[project.scripts]
+polyglot = "app:main"
+
+[tool.uv]
+# Packages already installed system-wide via pacman (python-pytorch-rocm etc.)
+# Marking them as excluded prevents uv from overriding them with PyPI versions.
+exclude-dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+    "networkx",
+    "sympy",
+    "tqdm",
+    "pyyaml",
+    "regex",
+    "filelock",
+    "packaging",
+    "requests",
+    "triton",
+]
