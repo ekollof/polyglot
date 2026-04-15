@@ -111,6 +111,36 @@ NonSpeechCallback = Callable[[str], None]
 SPEAKER_CHANGE_THRESHOLD: float = 0.75
 
 
+# Segments whose text is entirely Whisper noise/music tokens should be
+# suppressed.  The regex matches the *whole* stripped text.
+import re as _re
+
+_NOISE_TOKEN_RE = _re.compile(
+    r"^[\s♪♫♬♩]*"  # leading music notes / whitespace
+    r"(\[(?:"
+    r"music|applause|laughter|noise|silence|blank_audio"
+    r"|inaudible|cheering|crowd|background music|singing"
+    r")\]"
+    r"|♪[^♪]*♪"  # ♪ … ♪ pairs
+    r"|♪"
+    r"|\((?:music|applause|laughter|inaudible|singing)\)"
+    r")+"
+    r"[\s♪♫♬♩.!,]*$",  # trailing punctuation
+    _re.IGNORECASE,
+)
+
+# Segments whose avg_logprob is below this are likely music/noise
+# hallucinations.  Whisper's own threshold is -1.0; music hallucinations
+# typically cluster in [-0.65, -1.0] while real speech sits above -0.6.
+# Log every skipped segment so the threshold can be tuned from polyglot.log.
+AVG_LOGPROB_THRESHOLD: float = -0.65
+
+
+def _is_noise_token(text: str) -> bool:
+    """Return True if *text* consists entirely of Whisper noise/music tokens."""
+    return bool(_NOISE_TOKEN_RE.match(text.strip()))
+
+
 def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
     """Return True if text is a Whisper hallucination repetition loop.
 
@@ -740,12 +770,38 @@ class Transcriber:
                             seg_text[:60],
                         )
                         continue
+                    # Skip segments that are pure music/noise bracket tokens
+                    # (e.g. "[Music]", "♪ … ♪", "[Applause]").
+                    if _is_noise_token(seg_text):
+                        logger.debug(
+                            "  segment skipped — noise token: %r", seg_text[:60]
+                        )
+                        continue
+                    # Skip low-confidence segments likely produced by music or
+                    # background noise.  avg_logprob below AVG_LOGPROB_THRESHOLD
+                    # (-0.65) indicates the decoder was uncertain — hallucinated
+                    # speech during music falls in this range.
+                    seg_logprob = seg.get("avg_logprob", 0.0)
+                    if seg_logprob < AVG_LOGPROB_THRESHOLD:
+                        logger.debug(
+                            "  segment skipped — avg_logprob=%.3f (<%.2f) text=%r",
+                            seg_logprob,
+                            AVG_LOGPROB_THRESHOLD,
+                            seg_text[:60],
+                        )
+                        continue
                     # Skip hallucination repetition loops.
                     if _is_repetition_loop(seg_text):
                         logger.debug(
                             "  segment skipped — repetition loop: %r", seg_text[:60]
                         )
                         continue
+                    logger.debug(
+                        "  segment emitted — avg_logprob=%.3f no_speech_prob=%.3f text=%r",
+                        seg.get("avg_logprob", 0.0),
+                        seg.get("no_speech_prob", 0.0),
+                        seg_text[:60],
+                    )
                     self.on_result(detected_lang, seg_text, self._detected_confidence)
                     any_emitted = True
             else:
