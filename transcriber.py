@@ -58,10 +58,16 @@ logger = logging.getLogger(__name__)
 
 WHISPER_RATE = 16_000  # Hz required by Whisper
 VAD_CHUNK = 512  # samples per VAD call (32 ms @ 16 kHz)
-MAX_UTTERANCE_SECONDS = 25  # force-emit if utterance grows this long
+MAX_UTTERANCE_SECONDS = 25  # absolute safety cap
 # Maximum audio fed to a partial transcription pass.  Capped so that greedy
 # inference stays fast even during very long utterances.
 MAX_PARTIAL_SECONDS = 8
+
+# For continuous speech with no VAD silence (fast speakers, monologues),
+# force-commit after this many seconds so each commit contains 1–3 sentences
+# rather than a wall of text.  The buffer is reset and VAD state continues
+# so the next commit picks up seamlessly.
+ROLLING_COMMIT_S = 7.0
 
 # How often to fire interim (partial) results while speech is ongoing.
 # turbo runs at ~3× real-time on ROCm, so 1.0 s gives it enough headroom
@@ -1065,8 +1071,36 @@ class Transcriber:
                         lang,
                     )
 
+            # ── Rolling commit (continuous speech) ──────────────────────
+            # If speech has been active for ROLLING_COMMIT_S without a VAD
+            # silence end event (fast speaker / monologue), commit what we
+            # have and restart the buffer.  This keeps each commit to ~1–3
+            # sentences rather than a wall of text at the 25 s cap.
+            elapsed_speech = time.monotonic() - _utterance_start_time
+            if _speech_active and elapsed_speech >= ROLLING_COMMIT_S:
+                speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
+                if speech_chunks:
+                    audio = np.concatenate(speech_chunks)
+                    captured_lang = self._vad_lang
+                    self._infer_queue.put(("commit", audio, captured_lang))
+                    logger.debug(
+                        "Rolling commit — %.1fs elapsed, lang=%s, samples=%d.",
+                        elapsed_speech,
+                        captured_lang,
+                        len(audio),
+                    )
+
+                # Reset buffer; keep _speech_active=True and VAD state running.
+                # _detection_triggered stays True — language is still valid.
+                utterance = []
+                utterance_samples = 0
+                _speech_sample_offset = 0
+                _utterance_start_time = time.monotonic()
+                _last_interim_time = _utterance_start_time
+                # Keep _vad_lang: detection result still valid for next chunk.
+
             # ── Safety cap (wall-clock) ─────────────────────────────────
-            if (
+            elif (
                 _speech_active
                 and (time.monotonic() - _utterance_start_time) >= MAX_UTTERANCE_SECONDS
             ):
