@@ -323,6 +323,18 @@ class Transcriber:
                 _, audio = item
                 self._infer_detect(whisper_model, audio)
 
+            elif kind == "reset_lang":
+                # Silence expired — forget cached language so the next
+                # utterance re-detects from scratch without the two-pass
+                # threshold working against a stale value.
+                logger.debug(
+                    "Inference: resetting _detected_lang (was %s) on silence expiry.",
+                    self._detected_lang,
+                )
+                self._detected_lang = None
+                self._detected_confidence = None
+                self._last_speaker_embed = None  # speaker context also stale
+
             elif kind == "partial":
                 _, audio, lang = item
                 # Skip this partial only if a commit is already queued
@@ -814,12 +826,13 @@ class Transcriber:
                                 now - _silence_start_time,
                                 self._vad_lang,
                             )
-                            # Tell inference thread to forget the cached lang too.
-                            # We do this by posting a tiny sentinel; simpler: just
-                            # let the inference thread manage its own _detected_lang
-                            # and mirror it here via _vad_lang.
-                            # For the VAD thread's own read we just shadow it:
                             self._vad_lang = None
+                            # Tell the inference thread to forget its cached
+                            # language too, so the next utterance re-detects
+                            # without the two-pass threshold fighting a stale
+                            # value.  This is the only cross-thread write to
+                            # _detected_lang — done via the queue, not directly.
+                            self._infer_queue.put(("reset_lang",))
                 continue
 
             utterance.append(chunk)
