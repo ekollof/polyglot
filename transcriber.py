@@ -382,69 +382,77 @@ class Transcriber:
 
             kind = item[0]
 
-            if kind == "stop":
-                break
+            match kind:
+                case "stop":
+                    break
 
-            elif kind == "detect":
-                _, audio = item
-                self._infer_detect(whisper_model, audio)
+                case "detect":
+                    _, audio = item
+                    self._infer_detect(whisper_model, audio)
 
-            elif kind == "reset_lang":
-                # Silence expired — forget cached language so the next
-                # utterance re-detects from scratch without the two-pass
-                # threshold working against a stale value.
-                logger.debug(
-                    "Inference: resetting _detected_lang (was %s) on silence expiry.",
-                    self._detected_lang,
-                )
-                self._detected_lang = None
-                self._detected_confidence = None
-                self._last_speaker_embed = None  # speaker context also stale
+                case "reset_lang":
+                    # Silence expired — forget cached language so the next
+                    # utterance re-detects from scratch without the two-pass
+                    # threshold working against a stale value.
+                    logger.debug(
+                        "Inference: resetting _detected_lang (was %s) on silence expiry.",
+                        self._detected_lang,
+                    )
+                    self._detected_lang = None
+                    self._detected_confidence = None
+                    self._last_speaker_embed = None  # speaker context also stale
 
-            elif kind == "partial":
-                _, audio, lang = item
-                # Skip this partial only if a commit is already queued
-                # (it would be stale by the time we finish inference).
-                # Drain any intermediate partial/detect items to find out.
-                commit_pending = None
-                while True:
-                    try:
-                        nxt = self._infer_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt[0] in ("partial", "detect"):
-                        # Discard older partials — they are superseded by this one
-                        # or by the upcoming commit.
-                        logger.debug("Inference: discarding stale %s item.", nxt[0])
+                case "partial":
+                    _, audio, lang = item
+                    # Skip this partial only if a commit is already queued
+                    # (it would be stale by the time we finish inference).
+                    # Drain any intermediate partial/detect items to find out.
+                    commit_pending = None
+                    while True:
+                        try:
+                            nxt = self._infer_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        match nxt[0]:
+                            case "partial" | "detect":
+                                # Discard older partials — superseded by this one
+                                # or by the upcoming commit.
+                                logger.debug(
+                                    "Inference: discarding stale %s item.", nxt[0]
+                                )
+                            case _:
+                                # commit or stop — put it back and stop draining
+                                commit_pending = nxt
+                                self._infer_queue.put(nxt)
+                                break
+
+                    if commit_pending is None:
+                        # No commit waiting — run this partial.
+                        self._infer_partial(whisper_model, audio, lang)
                     else:
-                        # commit or stop — put it back and stop draining
-                        commit_pending = nxt
-                        self._infer_queue.put(nxt)
-                        break
-
-                if commit_pending is None:
-                    # No commit waiting — run this partial.
-                    self._infer_partial(whisper_model, audio, lang)
-                else:
-                    logger.debug("Inference: skipping partial — commit already queued.")
-
-            elif kind == "commit":
-                _, audio, lang = item
-                # Drain all stale partial/detect items ahead of next commit.
-                while True:
-                    try:
-                        nxt = self._infer_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt[0] in ("partial", "detect"):
                         logger.debug(
-                            "Inference: discarding stale %s before commit.", nxt[0]
+                            "Inference: skipping partial — commit already queued."
                         )
-                    else:
-                        # another commit or stop — put it back
-                        self._infer_queue.put(nxt)
-                        break
-                self._infer_commit(whisper_model, audio, lang)
+
+                case "commit":
+                    _, audio, lang = item
+                    # Drain all stale partial/detect items ahead of next commit.
+                    while True:
+                        try:
+                            nxt = self._infer_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        match nxt[0]:
+                            case "partial" | "detect":
+                                logger.debug(
+                                    "Inference: discarding stale %s before commit.",
+                                    nxt[0],
+                                )
+                            case _:
+                                # another commit or stop — put it back
+                                self._infer_queue.put(nxt)
+                                break
+                    self._infer_commit(whisper_model, audio, lang)
 
     # ------------------------------------------------------------------
 
