@@ -518,12 +518,12 @@ class PolyglotApp(App):
             audio_queue=self._audio_queue,
             on_result=self._on_transcription_result,
             on_partial=self._on_partial_result,
+            on_speaker_change=self._on_speaker_change,
+            on_non_speech=self._on_non_speech,
             model_name=self._model_name,
             device="cuda",
         )
         self._transcriber.start()
-
-        # Poll for model ready
         self._poll_model_ready()
 
     @work(thread=True)
@@ -547,6 +547,8 @@ class PolyglotApp(App):
             audio_queue=self._audio_queue,
             on_result=self._on_transcription_result,
             on_partial=self._on_partial_result,
+            on_speaker_change=self._on_speaker_change,
+            on_non_speech=self._on_non_speech,
             model_name=self._model_name,
             device="cuda",
         )
@@ -598,6 +600,18 @@ class PolyglotApp(App):
         )
 
     # ------------------------------------------------------------------
+    # Speaker-change / non-speech callbacks (called from transcriber thread)
+    # ------------------------------------------------------------------
+
+    def _on_speaker_change(self) -> None:
+        """Called by Transcriber when a speaker change is detected."""
+        self.call_from_thread(self._insert_speaker_separator)
+
+    def _on_non_speech(self, reason: str) -> None:
+        """Called by Transcriber when an utterance is classified as non-speech."""
+        logger.debug("Non-speech utterance suppressed (%s).", reason)
+
+    # ------------------------------------------------------------------
     # Translation callback (called from TranslationWorker thread)
     # ------------------------------------------------------------------
 
@@ -630,6 +644,28 @@ class PolyglotApp(App):
             log._line_cache.clear()  # type: ignore[attr-defined]
             log.virtual_size = log.virtual_size._replace(height=len(log.lines))
             log.refresh()
+
+    def _insert_speaker_separator(self) -> None:
+        """Insert a dim separator line between speaker turns.
+
+        A thin horizontal rule is added to the source pane.  A blank spacer
+        is added to the translation pane so the two logs stay visually aligned.
+        Both are treated as finalised rows — they have no translation slot and
+        will never be rewritten.
+        """
+        source_log = self.query_one("#source-log", RichLog)
+        trans_log = self.query_one("#translation-log", RichLog)
+
+        # If a dim partial is currently shown, clear it first so the separator
+        # appears above the next utterance, not in the middle of the current one.
+        if self._pending_row_id is not None:
+            self._pop_partial(source_log, self._source_strip_start)
+            self._pop_partial(trans_log, self._trans_strip_start)
+            self._pending_row_id = None
+
+        separator = Text("─" * 40, style="dim")
+        source_log.write(separator)
+        trans_log.write(Text("", style="dim"))  # blank spacer keeps panes aligned
 
     def _show_partial(self, row_id: int, partial_text: str, detected_lang: str) -> None:
         """Write or update the interim (dim) partial transcription line."""

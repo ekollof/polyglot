@@ -91,6 +91,25 @@ ResultCallback = Callable[[str, str, Optional[float]], None]
 PartialCallback = Callable[[str, str, Optional[float]], None]
 # (detected_lang, partial_text, confidence) — fired periodically during active speech
 
+SpeakerChangeCallback = Callable[[], None]
+# Fired when cosine similarity between consecutive utterance encoder
+# embeddings falls below SPEAKER_CHANGE_THRESHOLD.
+
+NonSpeechCallback = Callable[[str], None]
+# (reason) — fired when an utterance is classified as non-speech
+# (e.g. "no_speech", "silence").
+
+# ---------------------------------------------------------------------------
+# Speaker-change detection parameters
+# ---------------------------------------------------------------------------
+# Cosine similarity threshold below which consecutive utterance encoder
+# embeddings are considered to be from different speakers.
+# Range: [-1, 1].  Empirically, same-speaker successive utterances tend to
+# score 0.85–0.98; cross-speaker transitions tend to score 0.50–0.75.
+# 0.75 is a conservative starting point — increases recall at the cost of
+# slightly higher false-positive rate.
+SPEAKER_CHANGE_THRESHOLD: float = 0.75
+
 
 def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
     """Return True if text is a Whisper hallucination repetition loop.
@@ -158,11 +177,19 @@ class Transcriber:
     audio_queue:
         Queue fed by AudioCapture, containing float32 mono 16kHz chunks.
     on_result:
-        Callback called with (detected_language, source_text) when an
-        utterance is finalised.
+        Callback called with (detected_language, source_text, confidence) when
+        an utterance is finalised.
     on_partial:
         Optional callback called periodically while speech is ongoing, with
-        (detected_language, partial_text).
+        (detected_language, partial_text, confidence).
+    on_speaker_change:
+        Optional callback fired when the encoder-embedding cosine similarity
+        between consecutive utterances falls below SPEAKER_CHANGE_THRESHOLD.
+        Called with no arguments — the UI inserts a visual separator.
+    on_non_speech:
+        Optional callback fired when an utterance is classified as non-speech
+        (all segments suppressed or no_speech_prob too high).  Called with a
+        string reason, e.g. "no_speech".
     model_name:
         Whisper model identifier (e.g. "turbo", "small", "medium").
     device:
@@ -174,12 +201,16 @@ class Transcriber:
         audio_queue: queue.Queue,
         on_result: ResultCallback,
         on_partial: Optional[PartialCallback] = None,
+        on_speaker_change: Optional[SpeakerChangeCallback] = None,
+        on_non_speech: Optional[NonSpeechCallback] = None,
         model_name: str = "turbo",
         device: str = "cuda",
     ):
         self.audio_queue = audio_queue
         self.on_result = on_result
         self.on_partial = on_partial
+        self.on_speaker_change = on_speaker_change
+        self.on_non_speech = on_non_speech
         self.model_name = model_name
         self.device = device
 
@@ -200,6 +231,11 @@ class Transcriber:
         self._detected_lang: Optional[str] = None  # inference thread only
         self._detected_confidence: Optional[float] = None  # inference thread only
         self._vad_lang: Optional[str] = None  # shared, GIL-atomic
+
+        # Speaker embedding from the previous utterance (inference thread only).
+        # Normalised L2 unit vector, shape [n_state].  None until at least one
+        # utterance has been successfully encoded.
+        self._last_speaker_embed: Optional[torch.Tensor] = None  # inference thread only
 
     # ------------------------------------------------------------------
     # Public API
@@ -491,8 +527,53 @@ class Transcriber:
                 "Partial returned empty (raw=%r).", str(result.get("text", ""))[:40]
             )
 
+    def _compute_speaker_embed(
+        self, model, audio: np.ndarray
+    ) -> Optional[torch.Tensor]:
+        """Return a normalised mean-pooled encoder embedding for the audio.
+
+        Uses model.embed_audio() which runs only the encoder (no decoder),
+        so it adds minimal latency on top of the transcribe() call.
+
+        Returns None if the encoding fails.
+        """
+        try:
+            import whisper as _whisper
+
+            audio_t = torch.from_numpy(audio).to(model.device)
+            mel = _whisper.log_mel_spectrogram(audio_t, n_mels=model.dims.n_mels)
+            mel = _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
+            mel = mel.unsqueeze(0)  # [1, n_mels, N_FRAMES]
+
+            with torch.no_grad():
+                enc = model.embed_audio(mel)  # [1, T, n_state]
+
+            # Mean-pool over time dimension, then L2-normalise.
+            pooled = enc.mean(dim=1)  # [1, n_state]
+            norm = pooled / (pooled.norm(dim=-1, keepdim=True) + 1e-8)
+            return norm[0].cpu()  # [n_state]
+        except Exception as exc:
+            logger.warning("Speaker embed failed: %s", exc)
+            return None
+
     def _infer_commit(self, model, audio: np.ndarray, lang: Optional[str]) -> None:
-        """Run a final Whisper pass and fire on_result."""
+        """Run a final Whisper pass, detect speaker change, and fire on_result.
+
+        Speaker-change detection
+        ------------------------
+        After a successful transcribe() call, the encoder is run a second time
+        on the same (normalised) audio to obtain a mean-pooled embedding.
+        Cosine similarity is computed against the embedding from the previous
+        utterance.  If it falls below SPEAKER_CHANGE_THRESHOLD the
+        on_speaker_change callback is fired *before* on_result so that the UI
+        can insert a visual separator above the new utterance.
+
+        Non-speech classification
+        -------------------------
+        If all segments are suppressed by no_speech_prob filtering (or the
+        transcription returns empty text), on_non_speech is fired instead of
+        on_result.
+        """
         # Trim to last 30 s to keep encoder shape sane on ROCm.
         MAX_WHISPER_SAMPLES = 30 * WHISPER_RATE
         if len(audio) > MAX_WHISPER_SAMPLES:
@@ -504,6 +585,8 @@ class Transcriber:
         rms = float(np.sqrt(np.mean(audio**2)))
         if rms < 1e-4:
             logger.debug("Utterance is silence (rms=%.6f), skipping.", rms)
+            if self.on_non_speech:
+                self.on_non_speech("silence")
             return
 
         audio = _normalize_audio(audio, rms)
@@ -585,6 +668,8 @@ class Transcriber:
                     detected_lang,
                     raw_text[:40],
                 )
+                if self.on_non_speech:
+                    self.on_non_speech("no_speech")
                 return
 
             # Update cached language with what Whisper confirmed.
@@ -599,10 +684,37 @@ class Transcriber:
                 detected_lang,
             )
 
+            # ── Speaker-change detection ────────────────────────────────
+            # Compute encoder embedding for this utterance and compare to
+            # the previous one.  We do this AFTER transcribe() so the
+            # encoder result can be reused (embed_audio is a separate call
+            # but re-uses the already-loaded model weights on device).
+            if self.on_speaker_change:
+                current_embed = self._compute_speaker_embed(model, audio)
+                if current_embed is not None:
+                    if self._last_speaker_embed is not None:
+                        sim = float(
+                            torch.dot(self._last_speaker_embed, current_embed).item()
+                        )
+                        logger.debug(
+                            "Speaker similarity: %.3f (threshold=%.2f)",
+                            sim,
+                            SPEAKER_CHANGE_THRESHOLD,
+                        )
+                        if sim < SPEAKER_CHANGE_THRESHOLD:
+                            logger.debug(
+                                "Speaker change detected (sim=%.3f < %.2f).",
+                                sim,
+                                SPEAKER_CHANGE_THRESHOLD,
+                            )
+                            self.on_speaker_change()
+                    self._last_speaker_embed = current_embed
+
             # Emit each segment as a separate result so the UI shows one
             # sentence per row instead of a wall of text.  Fall back to the
             # full text as a single result if there are no segments (shouldn't
             # happen with Whisper, but be defensive).
+            any_emitted = False
             if segments:
                 for seg in segments:
                     seg_text = str(seg.get("text", "")).strip()
@@ -623,15 +735,21 @@ class Transcriber:
                         )
                         continue
                     self.on_result(detected_lang, seg_text, self._detected_confidence)
+                    any_emitted = True
             else:
                 if not _is_repetition_loop(source_text):
                     self.on_result(
                         detected_lang, source_text, self._detected_confidence
                     )
+                    any_emitted = True
                 else:
                     logger.debug(
                         "Commit suppressed — repetition loop: %r", source_text[:60]
                     )
+
+            if not any_emitted and self.on_non_speech:
+                # All segments were filtered — classify as non-speech.
+                self.on_non_speech("no_speech")
 
         except Exception as exc:
             logger.error("Whisper inference error: %s", exc, exc_info=True)
