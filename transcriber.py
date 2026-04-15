@@ -31,7 +31,7 @@ No additional locking is needed.
 VAD parameters
 --------------
 - threshold: 0.3
-- min_silence_duration_ms: 700 ms
+- min_silence_duration_ms: adaptive (300/400/600 ms based on speaker pace)
 - speech_pad_ms: 100 ms
 - max_utterance_seconds: 25 s
 
@@ -82,10 +82,38 @@ SILENCE_LANG_RESET_S = 3.0
 # VAD tuning
 # ---------------------------------------------------------------------------
 VAD_THRESHOLD = 0.3
-# 400 ms gives faster sentence boundaries for Japanese and other languages
-# with short inter-sentence pauses.  700 ms was too sluggish.
-VAD_MIN_SILENCE_MS = 400
 VAD_SPEECH_PAD_MS = 100
+
+# Adaptive silence threshold — recalculated after each utterance based on
+# the median duration of recent utterances.  Short utterances imply a fast
+# speaker who takes brief pauses; long utterances imply a slow/deliberate
+# speaker who may pause mid-thought.
+#
+# Thresholds (ms):       fast   medium   slow
+VAD_SILENCE_FAST_MS = 300  # median < FAST_THRESH_S
+VAD_SILENCE_MED_MS = 400  # median in [FAST_THRESH_S, SLOW_THRESH_S]
+VAD_SILENCE_SLOW_MS = 600  # median > SLOW_THRESH_S
+VAD_FAST_THRESH_S = 1.5  # utterances shorter than this → fast speaker
+VAD_SLOW_THRESH_S = 3.5  # utterances longer than this  → slow speaker
+VAD_ADAPT_WINDOW = 6  # number of recent utterances to median over
+
+
+def _adaptive_silence_ms(recent_durations: list) -> int:
+    """Return a VAD silence threshold (ms) based on recent utterance lengths.
+
+    Uses the median of the last VAD_ADAPT_WINDOW durations so that a single
+    unusually long or short utterance doesn't swing the threshold.
+    """
+    if not recent_durations:
+        return VAD_SILENCE_MED_MS
+    window = recent_durations[-VAD_ADAPT_WINDOW:]
+    median = sorted(window)[len(window) // 2]
+    if median < VAD_FAST_THRESH_S:
+        return VAD_SILENCE_FAST_MS
+    if median > VAD_SLOW_THRESH_S:
+        return VAD_SILENCE_SLOW_MS
+    return VAD_SILENCE_MED_MS
+
 
 ResultCallback = Callable[[str, str, Optional[float]], None]
 # (detected_lang, source_text, confidence)  confidence is None if unknown
@@ -843,11 +871,12 @@ class Transcriber:
 
         _vad_model, VADIterator = self._load_vad_only()
 
+        _current_silence_ms: int = VAD_SILENCE_MED_MS
         vad_iter = VADIterator(
             _vad_model,
             threshold=VAD_THRESHOLD,
             sampling_rate=WHISPER_RATE,
-            min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+            min_silence_duration_ms=_current_silence_ms,
             speech_pad_ms=VAD_SPEECH_PAD_MS,
         )
 
@@ -869,6 +898,7 @@ class Transcriber:
         _detection_triggered: bool = False
         _speech_sample_offset: int = 0
         _silence_start_time: float = time.monotonic()
+        _utterance_durations: list[float] = []  # recent utterance wall-clock lengths
 
         _vad_frame_count = 0
         _vad_prob_log_interval = 50
@@ -942,6 +972,10 @@ class Transcriber:
                     _silence_start_time = time.monotonic()
                     _detection_triggered = False
 
+                    # Record how long this utterance lasted (start→end).
+                    utterance_duration = _silence_start_time - _utterance_start_time
+                    _utterance_durations.append(utterance_duration)
+
                     speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
                     audio = (
                         np.concatenate(speech_chunks)
@@ -960,7 +994,32 @@ class Transcriber:
                     utterance = []
                     utterance_samples = 0
                     _speech_sample_offset = 0
-                    vad_iter.reset_states()
+
+                    # Adapt silence threshold for the next utterance based on
+                    # the pace of recent utterances.  Rebuild VADIterator only
+                    # when the threshold bracket changes so we don't thrash.
+                    new_silence_ms = _adaptive_silence_ms(_utterance_durations)
+                    if new_silence_ms != _current_silence_ms:
+                        _current_silence_ms = new_silence_ms
+                        vad_iter = VADIterator(
+                            _vad_model,
+                            threshold=VAD_THRESHOLD,
+                            sampling_rate=WHISPER_RATE,
+                            min_silence_duration_ms=_current_silence_ms,
+                            speech_pad_ms=VAD_SPEECH_PAD_MS,
+                        )
+                        logger.debug(
+                            "VAD silence threshold adapted to %d ms "
+                            "(median utterance %.1fs over last %d).",
+                            _current_silence_ms,
+                            sorted(_utterance_durations[-VAD_ADAPT_WINDOW:])[
+                                len(_utterance_durations[-VAD_ADAPT_WINDOW:]) // 2
+                            ],
+                            min(len(_utterance_durations), VAD_ADAPT_WINDOW),
+                        )
+                    else:
+                        vad_iter.reset_states()
+
                     # Clear so next utterance re-detects.
                     self._vad_lang = None
 
