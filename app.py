@@ -741,8 +741,11 @@ class PolyglotApp(App):
 
     def _show_partial(self, row_id: int, partial_text: str, detected_lang: str) -> None:
         """Write or update the interim (dim) partial transcription line."""
-        source_log = self.query_one("#source-log", RichLog)
-        trans_log = self.query_one("#translation-log", RichLog)
+        try:
+            source_log = self.query_one("#source-log", RichLog)
+            trans_log = self.query_one("#translation-log", RichLog)
+        except Exception:
+            return  # app is shutting down — widgets already removed
 
         if self._pending_row_id == row_id:
             # Replace the previous partial strips with updated text.
