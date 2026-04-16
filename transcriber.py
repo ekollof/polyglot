@@ -90,6 +90,11 @@ SILENCE_LANG_RESET_S = 3.0
 VAD_THRESHOLD = 0.3
 VAD_SPEECH_PAD_MS = 100
 
+# Pre-roll: include this many seconds of audio *before* the VAD "start" event.
+# RealtimeSTT uses 1 s; 0.5 s is enough to capture the onset phoneme without
+# adding much silence to the front of each utterance.
+VAD_PREROLL_S = 0.5
+
 # Adaptive silence threshold — recalculated after each utterance based on
 # the median duration of recent utterances.  Short utterances imply a fast
 # speaker who takes brief pauses; long utterances imply a slow/deliberate
@@ -298,6 +303,17 @@ class Transcriber:
         self._detected_confidence: Optional[float] = None  # inference thread only
         self._vad_lang: Optional[str] = None  # shared, GIL-atomic
 
+        # Last committed text, fed back as Whisper's initial_prompt to keep
+        # context consistent across rolling-commit window boundaries.
+        # Capped at ~200 chars (~224 tokens).  Inference thread only.
+        self._initial_prompt: str = ""
+
+        # Stuck-partial detection: if on_partial emits the same text N times
+        # consecutively, suppress further emissions until the text changes.
+        # Inference thread only.
+        self._last_partial_text: str = ""
+        self._stuck_partial_count: int = 0
+
         # Speaker embedding from the previous utterance (inference thread only).
         # Normalised L2 unit vector, shape [n_state].  None until at least one
         # utterance has been successfully encoded.
@@ -401,6 +417,11 @@ class Transcriber:
                     self._detected_lang = None
                     self._detected_confidence = None
                     self._last_speaker_embed = None  # speaker context also stale
+                    self._initial_prompt = (
+                        ""  # context no longer relevant after long silence
+                    )
+                    self._last_partial_text = ""
+                    self._stuck_partial_count = 0
 
                 case "partial":
                     _, audio, lang = item
@@ -593,7 +614,8 @@ class Transcriber:
                 no_speech_threshold=0.7,
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
-                condition_on_previous_text=False,
+                initial_prompt=self._initial_prompt or None,
+                condition_on_previous_text=bool(self._initial_prompt),
                 verbose=False,
             )
         except Exception as exc:
@@ -602,19 +624,61 @@ class Transcriber:
 
         # Use Whisper's detected language if we didn't have one.
         result_lang: str = str(result.get("language") or lang or "?")
-        text: str = str(result.get("text", "")).strip()
+        segments = result.get("segments", [])
+
+        # Filter segments the same way commits do — drop no_speech, noise
+        # tokens, and low-logprob segments so partials aren't polluted by
+        # hallucinations during quiet patches.
+        filtered_parts: list[str] = []
+        for seg in segments:
+            seg_text = str(seg.get("text", "")).strip()
+            if not seg_text:
+                continue
+            if seg.get("no_speech_prob", 0.0) > 0.7:
+                logger.debug(
+                    "Partial segment skipped — no_speech_prob=%.3f text=%r",
+                    seg.get("no_speech_prob", 0.0),
+                    seg_text[:60],
+                )
+                continue
+            if _is_noise_token(seg_text):
+                continue
+            if seg.get("avg_logprob", 0.0) < AVG_LOGPROB_THRESHOLD:
+                continue
+            filtered_parts.append(seg_text)
+
+        text: str = " ".join(filtered_parts).strip()
+        if not text:
+            # Fall back to raw text only if there are no segments (shouldn't
+            # normally happen) and the raw text passes basic checks.
+            raw = str(result.get("text", "")).strip()
+            if raw and not _is_noise_token(raw):
+                text = raw
         if text:
             if _is_repetition_loop(text):
                 logger.debug(
                     "Partial suppressed — repetition loop detected: %r", text[:60]
                 )
                 return
+            # Suppress identical consecutive partials (stuck-output detection).
+            # If Whisper keeps producing the same text for 3+ runs the model
+            # is looping on a segment — don't keep pushing the same line to the UI.
+            if text == self._last_partial_text:
+                self._stuck_partial_count += 1
+                if self._stuck_partial_count >= 3:
+                    logger.debug(
+                        "Partial suppressed — stuck output (%d identical runs): %r",
+                        self._stuck_partial_count,
+                        text[:60],
+                    )
+                    return
+            else:
+                self._stuck_partial_count = 0
+                self._last_partial_text = text
             logger.debug("Partial: %s", text[:80])
             self.on_partial(result_lang, text, self._detected_confidence)
         else:
-            logger.debug(
-                "Partial returned empty (raw=%r).", str(result.get("text", ""))[:40]
-            )
+            logger.debug("Partial returned no usable segments.")
 
     def _compute_speaker_embed(
         self, model, audio: np.ndarray
@@ -731,7 +795,8 @@ class Transcriber:
                 no_speech_threshold=0.7,
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
-                condition_on_previous_text=False,
+                initial_prompt=self._initial_prompt or None,
+                condition_on_previous_text=bool(self._initial_prompt),
                 verbose=False,
             )
 
@@ -865,6 +930,12 @@ class Transcriber:
             if not any_emitted and self.on_non_speech:
                 # All segments were filtered — classify as non-speech.
                 self.on_non_speech("no_speech")
+            elif any_emitted:
+                # Feed committed text back as context for the next call.
+                # Cap at 200 chars (~224 tokens) as whisper_streaming does.
+                self._initial_prompt = source_text[-200:]
+                self._last_partial_text = ""
+                self._stuck_partial_count = 0
 
         except Exception as exc:
             logger.error("Whisper inference error: %s", exc, exc_info=True)
@@ -975,7 +1046,11 @@ class Transcriber:
                 elif "start" in event:
                     logger.debug("VAD start at sample %d", utterance_samples)
                     _speech_active = True
-                    _speech_sample_offset = utterance_samples
+                    # Include a short pre-roll so the onset phoneme is not
+                    # clipped.  We already have the audio in utterance[]; just
+                    # move the speech-start pointer back by VAD_PREROLL_S.
+                    preroll = int(VAD_PREROLL_S * WHISPER_RATE)
+                    _speech_sample_offset = max(0, utterance_samples - preroll)
                     _utterance_start_time = time.monotonic()
                     _last_interim_time = _utterance_start_time
                     _detection_triggered = False
