@@ -859,7 +859,10 @@ class PolyglotApp(App):
         so that translations arriving after the next utterance has already
         started are not dropped.
         """
-        trans_log = self.query_one("#translation-log", RichLog)
+        try:
+            trans_log = self.query_one("#translation-log", RichLog)
+        except Exception:
+            return  # widget not yet mounted or app is shutting down
 
         # ── Partial translation: update the dim "…" live ────────────────
         if not is_final:
@@ -932,7 +935,16 @@ class PolyglotApp(App):
     # ------------------------------------------------------------------
 
     def _on_translator_status(self, message: str) -> None:
-        self.call_from_thread(self._set_status, message, "status-loading")
+        # This callback may be invoked from the main thread (e.g. set_engine()
+        # called directly from a UI event handler) OR from a background thread
+        # (network probe, argostranslate download).  Textual's call_from_thread
+        # raises RuntimeError when called from the main thread, so branch on it.
+        import threading
+
+        if threading.current_thread() is threading.main_thread():
+            self._set_status(message, "status-loading")
+        else:
+            self.call_from_thread(self._set_status, message, "status-loading")
 
     # ------------------------------------------------------------------
     # Widget event handlers
