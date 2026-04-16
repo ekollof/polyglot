@@ -75,9 +75,13 @@ ROLLING_COMMIT_S = 7.0
 INTERIM_INTERVAL_S = 1.0
 
 # How many seconds of audio to feed to detect_language().
-# 1.0 s is enough for reliable detection and gets the first detection result
-# before 2 s of speech elapses, unblocking partials sooner.
-DETECT_SECONDS = 1.0
+# 3.0 s gives Whisper enough audio to overcome zero-padding dominance in the
+# 30 s mel spectrogram window. With only 1 s of speech + 29 s of zeros the
+# silence bins swamp the signal and Whisper reliably misdetects short Farsi
+# (and other non-Latin-script) clips as English. At 3 s the real phonemes
+# dominate and detection accuracy is much higher (fa p=0.98 observed vs
+# en p=0.83 at 1 s).
+DETECT_SECONDS = 3.0
 
 # How many seconds of continuous silence before the cached detected language
 # is discarded.  This ensures that a long pause between speakers (e.g. video
