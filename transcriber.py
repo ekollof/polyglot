@@ -177,6 +177,13 @@ _NOISE_TOKEN_RE = _re.compile(
 # utterance are not dropped: forced language="en" makes those segments score
 # poorly even when they contain real speech.
 AVG_LOGPROB_THRESHOLD: float = -0.95
+# Segments that fall below AVG_LOGPROB_THRESHOLD but whose text is confidently
+# identified by Lingua as a *different* language than Whisper's detected_lang
+# are rescued up to this looser threshold.  The rationale: when Whisper runs
+# in the wrong language (e.g. en hint on fa audio), logprob is artificially
+# low because the decoder is fighting against the wrong phoneme distribution.
+# Lingua agrees the text is real language but just a different one.
+AVG_LOGPROB_RESCUE_THRESHOLD: float = -1.5
 
 # Seconds since the last confident language confirmation before we treat
 # _detected_lang as stale and clear it.  Prevents a wrong language from
@@ -187,6 +194,44 @@ LANG_STALE_SECONDS: float = 30.0
 def _is_noise_token(text: str) -> bool:
     """Return True if *text* consists entirely of Whisper noise/music tokens."""
     return bool(_NOISE_TOKEN_RE.match(text.strip()))
+
+
+# Languages that use Arabic / Persian script.
+_ARABIC_SCRIPT_LANGS: frozenset[str] = frozenset(
+    {"fa", "ar", "ur", "ps", "ug", "ku", "sd"}
+)
+
+
+def _partial_script_mismatch(text: str, expected_lang: Optional[str]) -> bool:
+    """Return True when text's dominant script doesn't match expected_lang.
+
+    Used to suppress partial hallucinations that switch language.  Only
+    triggers when expected_lang is a known Arabic-script language and the
+    partial is predominantly Latin, or vice-versa (Latin-primary language but
+    partial has predominantly Arabic script).  Does nothing when expected_lang
+    is unknown/None — better to show than to over-suppress.
+    """
+    if not expected_lang or not text:
+        return False
+    latin_count = sum(
+        1 for c in text if "\u0041" <= c <= "\u007a" or "\u00c0" <= c <= "\u024f"
+    )
+    arabic_count = sum(
+        1
+        for c in text
+        if "\u0600" <= c <= "\u06ff"
+        or "\u0750" <= c <= "\u077f"
+        or "\ufb50" <= c <= "\ufdff"
+    )
+    total = latin_count + arabic_count
+    if total < 4:
+        return False  # too short to judge
+    if expected_lang in _ARABIC_SCRIPT_LANGS:
+        # Expect Arabic script; suppress if mostly Latin.
+        return latin_count / total > 0.6
+    else:
+        # Expect Latin script; suppress if mostly Arabic.
+        return arabic_count / total > 0.6
 
 
 def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
@@ -953,6 +998,15 @@ class Transcriber:
                 self._stuck_partial_count = 0
                 self._last_partial_text = text
             logger.debug("Partial: %s", text[:80])
+            # Suppress partial if its script is inconsistent with the currently
+            # detected language (e.g. Korean/German/Latin text when fa is active).
+            if _partial_script_mismatch(text, self._detected_lang):
+                logger.debug(
+                    "Partial suppressed — script mismatch (detected=%s): %r",
+                    self._detected_lang,
+                    text[:60],
+                )
+                return
             self.on_partial(result_lang, text, self._detected_confidence)
         else:
             logger.debug("Partial returned no usable segments.")
@@ -1063,15 +1117,12 @@ class Transcriber:
         commit_lang: Optional[str] = None
         logger.debug("Commit: using Whisper auto-detect (lang hint=%s)", lang)
 
-        # Only use initial_prompt when it matches the hinted language — a
-        # mismatched English prompt on Farsi audio biases the decoder toward
-        # English and can cause translation.  Since commit_lang is always None
-        # now we only pass the prompt when the hint agrees with it.
-        use_initial_prompt = (
-            bool(self._initial_prompt)
-            and lang is not None
-            and self._initial_prompt_lang == lang
-        )
+        # Never pass initial_prompt to commits.  With multilingual audio the
+        # prompt is often in the wrong language (e.g. Arabic after a single
+        # Arabic phrase) and biases Whisper's decoder away from the actual
+        # speech, producing hallucinations or low-logprob garbage.  The cost
+        # (slightly less inter-utterance context) is far outweighed by the
+        # elimination of hallucination cascades.
 
         logger.debug(
             "Commit: audio shape=%s dtype=%s rms=%.4f lang=%s",
@@ -1093,8 +1144,8 @@ class Transcriber:
                 no_speech_threshold=1.0,  # disable internal suppression; our own filter handles it
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
-                initial_prompt=self._initial_prompt if use_initial_prompt else None,
-                condition_on_previous_text=use_initial_prompt,
+                initial_prompt=None,
+                condition_on_previous_text=False,
                 verbose=False,
             )
 
@@ -1149,6 +1200,9 @@ class Transcriber:
             # Update cached language with what Whisper confirmed.
             self._detected_lang = detected_lang
             self._vad_lang = detected_lang
+            # Refresh staleness timer so a language confirmed by every commit
+            # doesn't expire just because the LangID thread hasn't fired lately.
+            self._detected_lang_set_at = time.monotonic()
 
             elapsed = time.monotonic() - t0
             logger.debug(
@@ -1215,13 +1269,34 @@ class Transcriber:
                     # speech during music falls in this range.
                     seg_logprob = seg.get("avg_logprob", 0.0)
                     if seg_logprob < AVG_LOGPROB_THRESHOLD:
-                        logger.debug(
-                            "  segment skipped — avg_logprob=%.3f (<%.2f) text=%r",
-                            seg_logprob,
-                            AVG_LOGPROB_THRESHOLD,
-                            seg_text[:60],
-                        )
-                        continue
+                        # Before discarding, try a per-segment Lingua rescue.
+                        # If Lingua confidently identifies the segment text as a
+                        # *different* language from Whisper's detected_lang, the
+                        # low logprob is an artefact of wrong-language mode —
+                        # rescue it up to a looser threshold.
+                        rescued = False
+                        if (
+                            len(seg_text) >= 8
+                            and seg_logprob >= AVG_LOGPROB_RESCUE_THRESHOLD
+                        ):
+                            seg_lingua = _lingua_detect(seg_text)
+                            if seg_lingua is not None and seg_lingua != detected_lang:
+                                logger.debug(
+                                    "  segment rescued — Lingua=%s≠Whisper=%s avg_logprob=%.3f text=%r",
+                                    seg_lingua,
+                                    detected_lang,
+                                    seg_logprob,
+                                    seg_text[:60],
+                                )
+                                rescued = True
+                        if not rescued:
+                            logger.debug(
+                                "  segment skipped — avg_logprob=%.3f (<%.2f) text=%r",
+                                seg_logprob,
+                                AVG_LOGPROB_THRESHOLD,
+                                seg_text[:60],
+                            )
+                            continue
                     # Skip hallucination repetition loops.
                     if _is_repetition_loop(seg_text):
                         logger.debug(
@@ -1251,12 +1326,6 @@ class Transcriber:
                 # All segments were filtered — classify as non-speech.
                 self.on_non_speech("no_speech")
             elif any_emitted:
-                # Feed committed text back as context for the next call.
-                # Cap at 200 chars (~224 tokens) as whisper_streaming does.
-                # Track the language so we don't accidentally use an English
-                # prompt when transcribing Farsi (which would cause translation).
-                self._initial_prompt = source_text[-200:]
-                self._initial_prompt_lang = detected_lang
                 self._last_partial_text = ""
                 self._stuck_partial_count = 0
 

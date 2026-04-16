@@ -428,30 +428,11 @@ class TranslationWorker:
             if any(x is _STOP_SENTINEL for x in batch):
                 break
 
-            # For each row_id, keep only the latest partial; keep all finals.
-            # If a final exists for a row_id, skip any partial for that row too.
-            latest_partial: dict[int, tuple] = {}
-            finals_by_row: set[int] = set()
-            finals_ordered: list[tuple] = []
-
+            # Only finals are submitted (partials are never translated).
+            # Process all items in arrival order.
             for item in batch:
-                r_id, _, _, _, is_final, _ = item
-                if is_final:
-                    finals_by_row.add(r_id)
-                    finals_ordered.append(item)
-                else:
-                    latest_partial[r_id] = item  # overwrite: newer wins
-
-            # Process: latest partial per row (unless superseded by a final),
-            # then all finals in arrival order.
-            to_process: list[tuple] = []
-            for r_id, item in latest_partial.items():
-                if r_id not in finals_by_row:
-                    to_process.append(item)
-            to_process.extend(finals_ordered)
-
-            for item in to_process:
-                self._translate_item(item)
+                if item is not _STOP_SENTINEL:
+                    self._translate_item(item)
 
     def _translate_item(self, item: tuple) -> None:
         row_id, text, from_lang, to_lang, is_final, confidence = item
@@ -676,18 +657,11 @@ class PolyglotApp(App):
         row_id = self._next_row_id  # reuse the same row until finalised
         self.call_from_thread(self._show_partial, row_id, partial_text, detected_lang)
 
-        # Also submit a partial translation so the translation pane shows live
-        # text rather than a static "…" placeholder.
-        target = self._target_lang
-        if partial_text and detected_lang != "?" and self._translation_worker:
-            self._translation_worker.submit(
-                row_id=row_id,
-                text=partial_text,
-                from_lang=detected_lang,
-                to_lang=target,
-                is_final=False,
-                confidence=confidence,
-            )
+        # Partial translations are intentionally NOT submitted to the translation
+        # worker. Submitting partials causes slot/strip position races between
+        # _show_partial and _finalise_source on the main thread. The translation
+        # pane shows "…" (dim) while an utterance is in progress; the final
+        # translation arrives after the utterance is committed.
 
     def _on_transcription_result(
         self,
@@ -841,6 +815,12 @@ class PolyglotApp(App):
         trans_log.write(Text("…", style="dim"))  # translation placeholder
         self._trans_slots[row_id] = slot_start
         self._trans_slot_order.append(row_id)
+        logger.debug(
+            "_finalise_source row=%d slot=%d trans_log_len=%d",
+            row_id,
+            slot_start,
+            len(trans_log.lines),
+        )
         # _trans_strip_start tracks where the dim partial lives.  After a
         # finalise the "…" is a registered slot, not a dim partial, so clear
         # the pending marker.  _show_partial will set it again when the next
@@ -912,6 +892,13 @@ class PolyglotApp(App):
 
         # ── Final translation: slot-based in-place update ────────────────
         slot_start = self._trans_slots.get(row_id)
+        logger.debug(
+            "_update_translation_row row=%d slot=%s trans_log_len=%d pending_row=%s",
+            row_id,
+            slot_start,
+            len(trans_log.lines),
+            self._pending_row_id,
+        )
         if slot_start is None:
             # Slot not yet registered — _finalise_source hasn't run yet on the
             # main thread.  Stash and apply when it does.
