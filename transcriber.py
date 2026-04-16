@@ -138,6 +138,18 @@ NonSpeechCallback = Callable[[str], None]
 # slightly higher false-positive rate.
 SPEAKER_CHANGE_THRESHOLD: float = 0.75
 
+# ---------------------------------------------------------------------------
+# Language ID fusion weights
+# ---------------------------------------------------------------------------
+# SpeechBrain VoxLingua107 runs in its own dedicated thread (LangID) and
+# produces audio-domain language probabilities independently of Whisper.
+# When both detectors agree, confidence is a weighted average biased toward
+# SpeechBrain (purpose-built audio LID, 6.7% WER on 107 languages).
+# When they disagree, the higher-confidence detector wins but is discounted.
+LANGID_WEIGHT_SB: float = 0.60  # SpeechBrain share when detectors agree
+LANGID_WEIGHT_WH: float = 0.40  # Whisper share when detectors agree
+LANGID_DISAGREE_DISCOUNT: float = 0.80  # multiply winner confidence on disagree
+
 
 # Segments whose text is entirely Whisper noise/music tokens should be
 # suppressed.  The regex matches the *whole* stripped text.
@@ -191,6 +203,49 @@ def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
             if count >= min_repeats:
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Lingua text-based language detection (module-level lazy singleton)
+# ---------------------------------------------------------------------------
+# Used as a cross-check on committed transcript text.  Lingua's rule-based
+# engine is script-aware: Persian/Arabic characters trigger immediate high-
+# confidence detection of 'fa'/'ar', making it an excellent veto for the
+# case where Whisper correctly transcribes the script but mislabels it.
+# Thread-safe: Lingua documentation explicitly guarantees this.
+
+_lingua_detector = None  # lazily initialised on first call
+
+
+def _lingua_detect(text: str) -> Optional[str]:
+    """Return ISO 639-1 language code for *text*, or None if uncertain.
+
+    Uses Lingua's full-language detector (75 languages).  The detector is
+    built lazily on first call and cached for the life of the process.
+    Only returns a result when Lingua's top confidence value exceeds 0.70,
+    i.e. the library is reasonably sure.
+    """
+    global _lingua_detector
+    try:
+        if _lingua_detector is None:
+            from lingua import LanguageDetectorBuilder
+
+            _lingua_detector = (
+                LanguageDetectorBuilder.from_all_languages()
+                .with_preloaded_language_models()
+                .build()
+            )
+        values = _lingua_detector.compute_language_confidence_values(text)
+        if not values:
+            return None
+        top = values[0]  # sorted descending by confidence
+        if top.value < 0.70:
+            return None
+        # iso_code_639_1 is an enum; .name is e.g. "EN", "FA", "FR", "JA"
+        return top.language.iso_code_639_1.name.lower()
+    except Exception as exc:
+        logger.debug("Lingua detection error: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +330,7 @@ class Transcriber:
         self._stop_event = threading.Event()
         self._vad_thread: Optional[threading.Thread] = None
         self._infer_thread: Optional[threading.Thread] = None
+        self._langid_thread: Optional[threading.Thread] = None
         self._whisper_model = None
         self._ready = threading.Event()
 
@@ -288,6 +344,12 @@ class Transcriber:
         # Items: ("detect", audio) | ("partial", audio, lang) | ("commit", audio, lang)
         self._infer_queue: queue.Queue = queue.Queue()
 
+        # Separate queue for the SpeechBrain LangID thread.  VAD thread posts
+        # the same detection snapshot here; the LangID thread processes it
+        # independently without blocking Whisper inference.
+        # Items: np.ndarray audio snapshot, or None (sentinel to stop thread).
+        self._langid_queue: queue.Queue = queue.Queue()
+
         # _detected_lang/_detected_confidence are ONLY read and written by the
         # inference thread.  The VAD thread reads lang via _vad_lang (a plain
         # Optional[str] written by the inference thread).  Python's GIL makes
@@ -295,6 +357,11 @@ class Transcriber:
         self._detected_lang: Optional[str] = None  # inference thread only
         self._detected_confidence: Optional[float] = None  # inference thread only
         self._vad_lang: Optional[str] = None  # shared, GIL-atomic
+
+        # SpeechBrain LangID results — written by LangID thread, read by
+        # inference thread.  Plain attribute writes are GIL-atomic in CPython.
+        self._sb_lang: Optional[str] = None  # LangID thread → inference thread
+        self._sb_confidence: Optional[float] = None  # LangID thread → inference thread
 
         # Last committed text, fed back as Whisper's initial_prompt to keep
         # context consistent across rolling-commit window boundaries.
@@ -325,7 +392,7 @@ class Transcriber:
         return self._ready.is_set()
 
     def start(self) -> None:
-        """Start the VAD and inference threads (loads models asynchronously)."""
+        """Start the VAD, inference, and LangID threads (loads models asynchronously)."""
         if self._vad_thread and self._vad_thread.is_alive():
             return
         self._stop_event.clear()
@@ -336,13 +403,20 @@ class Transcriber:
         self._infer_thread.start()
         self._vad_thread = threading.Thread(target=self._run, daemon=True, name="VAD")
         self._vad_thread.start()
+        # LangID thread loads SpeechBrain independently — does not block VAD/Whisper.
+        self._langid_thread = threading.Thread(
+            target=self._run_langid, daemon=True, name="LangID"
+        )
+        self._langid_thread.start()
 
     def stop(self) -> None:
-        """Stop both threads."""
+        """Stop all threads."""
         self._stop_event.set()
         # Unblock the inference thread if it is waiting on an empty queue.
         self._infer_queue.put(("stop",))
-        for t in (self._vad_thread, self._infer_thread):
+        # Unblock the LangID thread.
+        self._langid_queue.put(None)
+        for t in (self._vad_thread, self._infer_thread, self._langid_thread):
             if t:
                 try:
                     t.join(timeout=5)
@@ -372,6 +446,79 @@ class Transcriber:
 
         logger.info("Whisper model loaded.")
         return whisper_model
+
+    # ------------------------------------------------------------------
+    # LangID thread  (SpeechBrain VoxLingua107, runs in parallel to Whisper)
+    # ------------------------------------------------------------------
+
+    def _run_langid(self) -> None:
+        """Dedicated thread for SpeechBrain spoken-language identification.
+
+        Loads the VoxLingua107 ECAPA-TDNN model from HuggingFace (cached to
+        ~/.cache/speechbrain/).  Processes audio snapshots posted by the VAD
+        thread onto _langid_queue independently of the Whisper inference thread
+        — no GPU contention because SpeechBrain inference is fast (~10-30 ms).
+
+        Results (_sb_lang, _sb_confidence) are written as plain attribute
+        assignments; CPython's GIL makes these atomic so no lock is needed.
+
+        VoxLingua107 label quirks (fixed in _SB_LANG_FIXES):
+          "iw" → "he" (Hebrew — obsolete ISO code)
+          "jw" → "jv" (Javanese — incorrect ISO code)
+        """
+        _SB_LANG_FIXES = {"iw": "he", "jw": "jv"}
+
+        try:
+            from pathlib import Path as _Path
+
+            from speechbrain.inference.classifiers import EncoderClassifier
+
+            logger.info("LangID — loading SpeechBrain VoxLingua107 model…")
+            _savedir = str(
+                _Path.home() / ".cache" / "speechbrain" / "lang-id-voxlingua107-ecapa"
+            )
+            language_id = EncoderClassifier.from_hparams(
+                source="speechbrain/lang-id-voxlingua107-ecapa",
+                savedir=_savedir,
+                run_opts={"device": self.device},
+            )
+            logger.info("LangID — SpeechBrain VoxLingua107 loaded.")
+        except Exception as exc:
+            logger.error(
+                "LangID — failed to load SpeechBrain model; "
+                "falling back to Whisper-only detection: %s",
+                exc,
+            )
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                item = self._langid_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if item is None:  # stop sentinel
+                break
+
+            audio: np.ndarray = item
+            try:
+                import torch as _torch
+
+                # SpeechBrain expects [batch, time] float32 tensor at 16 kHz.
+                sig = _torch.from_numpy(audio).unsqueeze(0).float()
+                prediction = language_id.classify_batch(sig)
+                # prediction[3]: list of label strings, e.g. ["fa: Persian"]
+                # prediction[1]: tensor of top-1 log-likelihoods; .exp() → prob
+                raw_label: str = prediction[3][0]
+                iso: str = raw_label.split(":")[0].strip()
+                iso = _SB_LANG_FIXES.get(iso, iso)
+                prob: float = float(prediction[1].exp().item())
+                logger.debug("LangID SpeechBrain: %s (p=%.2f)", iso, prob)
+                # GIL-atomic writes — no lock needed
+                self._sb_lang = iso
+                self._sb_confidence = prob
+            except Exception as exc:
+                logger.error("LangID inference error: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Inference thread  (the ONLY Whisper caller)
@@ -508,6 +655,47 @@ class Transcriber:
 
             lang, confidence = _detect_on_slice(audio)
             logger.debug("Language detection: %s (p=%.2f)", lang, confidence)
+
+            # ── Fuse with SpeechBrain LangID result (if available) ──────────
+            # _sb_lang/_sb_confidence are written by the LangID thread; reads
+            # here are GIL-atomic in CPython (no lock needed).
+            # SpeechBrain is purpose-built for spoken language ID (6.7% error
+            # on VoxLingua107 dev set, 107 languages) so it gets a higher
+            # weight when both detectors agree.
+            sb_lang = self._sb_lang
+            sb_conf = self._sb_confidence
+            if sb_lang is not None and sb_conf is not None:
+                if sb_lang == lang:
+                    # Agreement: weighted average, biased toward SpeechBrain.
+                    combined = (
+                        LANGID_WEIGHT_WH * confidence + LANGID_WEIGHT_SB * sb_conf
+                    )
+                    logger.debug(
+                        "LangID fusion (agree %s): wh=%.2f sb=%.2f → %.2f",
+                        lang,
+                        confidence,
+                        sb_conf,
+                        combined,
+                    )
+                    confidence = combined
+                else:
+                    # Disagreement: take the higher-confidence result but
+                    # discount it to reflect the uncertainty.
+                    wh_lang_orig, wh_conf_orig = lang, confidence
+                    if sb_conf > confidence:
+                        lang = sb_lang
+                        confidence = sb_conf * LANGID_DISAGREE_DISCOUNT
+                    else:
+                        confidence = confidence * LANGID_DISAGREE_DISCOUNT
+                    logger.debug(
+                        "LangID fusion (disagree): wh=%s(%.2f) sb=%s(%.2f) → %s(%.2f)",
+                        wh_lang_orig,
+                        wh_conf_orig,
+                        sb_lang,
+                        sb_conf,
+                        lang,
+                        confidence,
+                    )
 
             MIN_CONFIDENT = 0.80
             MIN_AMBIGUOUS = 0.65
@@ -865,6 +1053,28 @@ class Transcriber:
             raw_text: str = str(source_result.get("text", ""))
             source_text: str = raw_text.strip()
 
+            # ── Lingua text-based language cross-check ───────────────────
+            # Lingua's rule engine recognises script characters immediately
+            # (e.g. Arabic/Persian script → 'fa'/'ar' at confidence 1.0).
+            # This catches the edge case where Whisper correctly transcribes
+            # the script but still labels the segment with the wrong language
+            # tag.  Only override when text is long enough to be reliable and
+            # Lingua is confident (>= 0.70 — enforced inside _lingua_detect).
+            if len(source_text) >= 15:
+                lingua_lang = _lingua_detect(source_text)
+                if lingua_lang is not None and lingua_lang != detected_lang:
+                    logger.info(
+                        "Lingua overrides Whisper lang %s → %s for text %r",
+                        detected_lang,
+                        lingua_lang,
+                        source_text[:50],
+                    )
+                    detected_lang = lingua_lang
+                elif lingua_lang:
+                    logger.debug(
+                        "Lingua confirms lang=%s for %r", lingua_lang, source_text[:30]
+                    )
+
             segments = source_result.get("segments", [])
 
             # Log segment-level no_speech_prob so we can diagnose suppression.
@@ -1161,6 +1371,7 @@ class Transcriber:
                     : int(DETECT_SECONDS * WHISPER_RATE)
                 ]
                 self._infer_queue.put(("detect", snapshot))
+                self._langid_queue.put(snapshot)  # also feed SpeechBrain LangID thread
                 _detection_triggered = True
                 logger.debug(
                     "VAD — queued language detection (%d samples).", len(snapshot)
