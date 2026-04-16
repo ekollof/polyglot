@@ -295,7 +295,11 @@ class Transcriber:
         # Last committed text, fed back as Whisper's initial_prompt to keep
         # context consistent across rolling-commit window boundaries.
         # Capped at ~200 chars (~224 tokens).  Inference thread only.
+        # Only used when the commit language matches the prompt language —
+        # a mismatched prompt biases the decoder toward the prompt's language
+        # and causes Whisper to translate instead of transcribe.
         self._initial_prompt: str = ""
+        self._initial_prompt_lang: Optional[str] = None  # language of _initial_prompt
 
         # Stuck-partial detection: if on_partial emits the same text N times
         # consecutively, suppress further emissions until the text changes.
@@ -505,11 +509,26 @@ class Transcriber:
             MIN_AMBIGUOUS = 0.65
 
             if self._detected_lang is None or lang == self._detected_lang:
-                # No existing language, or same language confirmed — always accept.
+                # No existing language, or same language confirmed — accept if
+                # confidence meets the minimum bar.
                 if confidence >= MIN_AMBIGUOUS:
                     self._detected_lang = lang
                     self._detected_confidence = confidence
                     self._vad_lang = lang
+                elif confidence < 0.40:
+                    # Very low confidence even for the cached language means
+                    # Whisper is >60% sure this is NOT the cached language.
+                    # Clear the cache so the next commit auto-detects on the
+                    # full audio rather than being forced into the wrong language.
+                    logger.debug(
+                        "Confidence %.2f very low for cached lang '%s' — "
+                        "clearing cache to force auto-detect on next commit.",
+                        confidence,
+                        self._detected_lang,
+                    )
+                    self._detected_lang = None
+                    self._detected_confidence = None
+                    self._vad_lang = None
                 else:
                     logger.debug(
                         "Language detection rejected — confidence %.2f < %.2f; keeping %s.",
@@ -592,20 +611,35 @@ class Transcriber:
                 "Partial — lang not yet detected, letting Whisper auto-detect."
             )
 
+        # Only force language if detection was confident — same rule as commits.
+        _PARTIAL_LANG_MIN_CONFIDENCE = 0.70
+        partial_lang: Optional[str] = (
+            lang
+            if lang is not None
+            and self._detected_confidence is not None
+            and self._detected_confidence >= _PARTIAL_LANG_MIN_CONFIDENCE
+            else None
+        )
+        use_initial_prompt = (
+            bool(self._initial_prompt)
+            and partial_lang is not None
+            and self._initial_prompt_lang == partial_lang
+        )
+
         audio = _normalize_audio(audio, rms)
         try:
             result = model.transcribe(
                 audio,
                 task="transcribe",
-                language=lang,  # None → Whisper auto-detects
+                language=partial_lang,
                 fp16=self.device != "cpu",
                 temperature=(0.0, 0.2),
                 beam_size=1,
                 no_speech_threshold=0.7,
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
-                initial_prompt=self._initial_prompt or None,
-                condition_on_previous_text=bool(self._initial_prompt),
+                initial_prompt=self._initial_prompt if use_initial_prompt else None,
+                condition_on_previous_text=use_initial_prompt,
                 verbose=False,
             )
         except Exception as exc:
@@ -767,6 +801,37 @@ class Transcriber:
             except Exception as exc:
                 logger.warning("Inline detect failed: %s", exc)
 
+        # Only force the language if detection was confident enough.
+        # Whisper with a wrong forced language (and matching initial_prompt)
+        # translates instead of transcribing.  With lang=None, Whisper
+        # auto-detects on the full 5-7s commit audio — far more reliable than
+        # the 1s detection snippet used by _infer_detect.
+        _COMMIT_LANG_MIN_CONFIDENCE = 0.70
+        commit_lang: Optional[str] = (
+            lang
+            if lang is not None
+            and self._detected_confidence is not None
+            and self._detected_confidence >= _COMMIT_LANG_MIN_CONFIDENCE
+            else None
+        )
+        if commit_lang is None and lang is not None:
+            logger.debug(
+                "Commit: confidence %.2f < %.2f for lang=%s — using Whisper auto-detect.",
+                self._detected_confidence or 0.0,
+                _COMMIT_LANG_MIN_CONFIDENCE,
+                lang,
+            )
+
+        # Only use initial_prompt when it was generated for the same language
+        # as this commit.  A mismatched prompt (e.g. English prompt on Farsi
+        # audio) biases the decoder toward the prompt language and causes
+        # Whisper to translate instead of transcribe.
+        use_initial_prompt = (
+            bool(self._initial_prompt)
+            and commit_lang is not None
+            and self._initial_prompt_lang == commit_lang
+        )
+
         logger.debug(
             "Commit: audio shape=%s dtype=%s rms=%.4f lang=%s",
             audio.shape,
@@ -780,15 +845,15 @@ class Transcriber:
             source_result = model.transcribe(
                 audio,
                 task="transcribe",
-                language=lang,
+                language=commit_lang,
                 fp16=self.device != "cpu",
                 temperature=(0.0, 0.2),
                 beam_size=1,
                 no_speech_threshold=0.7,
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
-                initial_prompt=self._initial_prompt or None,
-                condition_on_previous_text=bool(self._initial_prompt),
+                initial_prompt=self._initial_prompt if use_initial_prompt else None,
+                condition_on_previous_text=use_initial_prompt,
                 verbose=False,
             )
 
@@ -925,7 +990,10 @@ class Transcriber:
             elif any_emitted:
                 # Feed committed text back as context for the next call.
                 # Cap at 200 chars (~224 tokens) as whisper_streaming does.
+                # Track the language so we don't accidentally use an English
+                # prompt when transcribing Farsi (which would cause translation).
                 self._initial_prompt = source_text[-200:]
+                self._initial_prompt_lang = detected_lang
                 self._last_partial_text = ""
                 self._stuck_partial_count = 0
 
