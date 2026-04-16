@@ -90,40 +90,23 @@ SILENCE_LANG_RESET_S = 3.0
 VAD_THRESHOLD = 0.3
 VAD_SPEECH_PAD_MS = 100
 
+# Fixed end-of-speech silence threshold.  All three reference engines
+# (RealtimeSTT=600ms, whisper_streaming=500ms, WhisperLive≈700ms) use a
+# fixed value.  Adaptive thresholds based on utterance duration don't
+# generalise well across languages and speaker styles.
+VAD_SILENCE_MS = 600
+
 # Pre-roll: include this many seconds of audio *before* the VAD "start" event.
 # RealtimeSTT uses 1 s; 0.5 s is enough to capture the onset phoneme without
 # adding much silence to the front of each utterance.
 VAD_PREROLL_S = 0.5
 
-# Adaptive silence threshold — recalculated after each utterance based on
-# the median duration of recent utterances.  Short utterances imply a fast
-# speaker who takes brief pauses; long utterances imply a slow/deliberate
-# speaker who may pause mid-thought.
-#
-# Thresholds (ms):       fast   medium   slow
-VAD_SILENCE_FAST_MS = 300  # median < FAST_THRESH_S
-VAD_SILENCE_MED_MS = 400  # median in [FAST_THRESH_S, SLOW_THRESH_S]
-VAD_SILENCE_SLOW_MS = 600  # median > SLOW_THRESH_S
-VAD_FAST_THRESH_S = 1.5  # utterances shorter than this → fast speaker
-VAD_SLOW_THRESH_S = 3.5  # utterances longer than this  → slow speaker
-VAD_ADAPT_WINDOW = 6  # number of recent utterances to median over
-
-
-def _adaptive_silence_ms(recent_durations: list) -> int:
-    """Return a VAD silence threshold (ms) based on recent utterance lengths.
-
-    Uses the median of the last VAD_ADAPT_WINDOW durations so that a single
-    unusually long or short utterance doesn't swing the threshold.
-    """
-    if not recent_durations:
-        return VAD_SILENCE_MED_MS
-    window = recent_durations[-VAD_ADAPT_WINDOW:]
-    median = sorted(window)[len(window) // 2]
-    if median < VAD_FAST_THRESH_S:
-        return VAD_SILENCE_FAST_MS
-    if median > VAD_SLOW_THRESH_S:
-        return VAD_SILENCE_SLOW_MS
-    return VAD_SILENCE_MED_MS
+# Content-based early commit: if the partial transcript has been identical for
+# this many consecutive inference runs, treat the utterance as complete and
+# commit without waiting for VAD silence.  Mirrors WhisperLive's
+# same_output_threshold (7–10 cycles); 3 cycles at INTERIM_INTERVAL_S=1.0s
+# means we commit ~3 s after the speaker stops changing their words.
+CONTENT_COMMIT_STABLE_RUNS = 3
 
 
 ResultCallback = Callable[[str, str, Optional[float]], None]
@@ -291,6 +274,12 @@ class Transcriber:
         self._whisper_model = None
         self._ready = threading.Event()
 
+        # Set by the inference thread when a partial transcript has stabilised
+        # (CONTENT_COMMIT_STABLE_RUNS identical consecutive runs).  The VAD
+        # thread polls this and triggers a commit + buffer reset, matching
+        # WhisperLive's same_output_threshold mechanism.
+        self._commit_requested = threading.Event()
+
         # Work queue between VAD thread and inference thread.
         # Items: ("detect", audio) | ("partial", audio, lang) | ("commit", audio, lang)
         self._infer_queue: queue.Queue = queue.Queue()
@@ -422,6 +411,7 @@ class Transcriber:
                     )
                     self._last_partial_text = ""
                     self._stuck_partial_count = 0
+                    self._commit_requested.clear()
 
                 case "partial":
                     _, audio, lang = item
@@ -660,18 +650,20 @@ class Transcriber:
                     "Partial suppressed — repetition loop detected: %r", text[:60]
                 )
                 return
-            # Suppress identical consecutive partials (stuck-output detection).
-            # If Whisper keeps producing the same text for 3+ runs the model
-            # is looping on a segment — don't keep pushing the same line to the UI.
+            # Content-based early commit (WhisperLive same_output_threshold).
+            # If the partial text hasn't changed for CONTENT_COMMIT_STABLE_RUNS
+            # consecutive inference runs, the speaker has likely stopped — signal
+            # the VAD thread to commit now rather than waiting for silence.
             if text == self._last_partial_text:
                 self._stuck_partial_count += 1
-                if self._stuck_partial_count >= 3:
+                if self._stuck_partial_count >= CONTENT_COMMIT_STABLE_RUNS:
                     logger.debug(
-                        "Partial suppressed — stuck output (%d identical runs): %r",
+                        "Partial stable for %d runs — requesting early commit: %r",
                         self._stuck_partial_count,
                         text[:60],
                     )
-                    return
+                    self._commit_requested.set()
+                    return  # suppress the duplicate partial emission too
             else:
                 self._stuck_partial_count = 0
                 self._last_partial_text = text
@@ -956,12 +948,11 @@ class Transcriber:
 
         _vad_model, VADIterator = self._load_vad_only()
 
-        _current_silence_ms: int = VAD_SILENCE_MED_MS
         vad_iter = VADIterator(
             _vad_model,
             threshold=VAD_THRESHOLD,
             sampling_rate=WHISPER_RATE,
-            min_silence_duration_ms=_current_silence_ms,
+            min_silence_duration_ms=VAD_SILENCE_MS,
             speech_pad_ms=VAD_SPEECH_PAD_MS,
         )
 
@@ -983,7 +974,6 @@ class Transcriber:
         _detection_triggered: bool = False
         _speech_sample_offset: int = 0
         _silence_start_time: float = time.monotonic()
-        _utterance_durations: list[float] = []  # recent utterance wall-clock lengths
 
         _vad_frame_count = 0
         _vad_prob_log_interval = 50
@@ -1061,10 +1051,6 @@ class Transcriber:
                     _silence_start_time = time.monotonic()
                     _detection_triggered = False
 
-                    # Record how long this utterance lasted (start→end).
-                    utterance_duration = _silence_start_time - _utterance_start_time
-                    _utterance_durations.append(utterance_duration)
-
                     speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
                     audio = (
                         np.concatenate(speech_chunks)
@@ -1084,33 +1070,10 @@ class Transcriber:
                     utterance_samples = 0
                     _speech_sample_offset = 0
 
-                    # Adapt silence threshold for the next utterance based on
-                    # the pace of recent utterances.  Rebuild VADIterator only
-                    # when the threshold bracket changes so we don't thrash.
-                    new_silence_ms = _adaptive_silence_ms(_utterance_durations)
-                    if new_silence_ms != _current_silence_ms:
-                        _current_silence_ms = new_silence_ms
-                        vad_iter = VADIterator(
-                            _vad_model,
-                            threshold=VAD_THRESHOLD,
-                            sampling_rate=WHISPER_RATE,
-                            min_silence_duration_ms=_current_silence_ms,
-                            speech_pad_ms=VAD_SPEECH_PAD_MS,
-                        )
-                        logger.debug(
-                            "VAD silence threshold adapted to %d ms "
-                            "(median utterance %.1fs over last %d).",
-                            _current_silence_ms,
-                            sorted(_utterance_durations[-VAD_ADAPT_WINDOW:])[
-                                len(_utterance_durations[-VAD_ADAPT_WINDOW:]) // 2
-                            ],
-                            min(len(_utterance_durations), VAD_ADAPT_WINDOW),
-                        )
-                    else:
-                        vad_iter.reset_states()
-
                     # Clear so next utterance re-detects.
                     self._vad_lang = None
+
+                    vad_iter.reset_states()
 
             remainder = audio_for_vad[i:]
 
@@ -1153,6 +1116,29 @@ class Transcriber:
                         len(audio),
                         lang,
                     )
+
+            # ── Content-based early commit ───────────────────────────────────
+            # Inference thread signals this when the partial transcript has
+            # been identical for CONTENT_COMMIT_STABLE_RUNS consecutive runs,
+            # meaning the speaker has stopped changing their words.
+            if _speech_active and self._commit_requested.is_set():
+                self._commit_requested.clear()
+                speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
+                if speech_chunks:
+                    audio = np.concatenate(speech_chunks)
+                    captured_lang = self._vad_lang
+                    self._infer_queue.put(("commit", audio, captured_lang))
+                    logger.debug(
+                        "Content commit — stable partial triggered early commit, lang=%s, samples=%d.",
+                        captured_lang,
+                        len(audio),
+                    )
+                # Reset buffer same as rolling commit; keep VAD state running.
+                utterance = []
+                utterance_samples = 0
+                _speech_sample_offset = 0
+                _utterance_start_time = time.monotonic()
+                _last_interim_time = _utterance_start_time
 
             # ── Rolling commit (continuous speech) ──────────────────────
             # If speech has been active for ROLLING_COMMIT_S without a VAD
