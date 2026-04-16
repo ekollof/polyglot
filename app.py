@@ -847,17 +847,33 @@ class PolyglotApp(App):
         # interim result arrives.
         self._pending_row_id = None
 
-        # Apply any translation that arrived before the slot was registered
-        # (race: translation worker → call_from_thread may beat this call).
-        if row_id in self._pending_trans:
-            translation, from_lang, confidence = self._pending_trans.pop(row_id)
-            self._update_translation_row(
-                row_id, translation, True, from_lang, confidence
-            )
+        # If a translation already arrived before this slot was registered,
+        # schedule a deferred flush rather than applying it immediately.
+        # Applying it now would re-append the partial placeholder before the
+        # remaining _finalise_source calls for sibling segments have run,
+        # corrupting all subsequent slot positions.
+        if self._pending_trans:
+            self.set_timer(0.0, self._flush_pending_trans)
 
         self._row_count += 1
         self._detected_lang = detected_lang
         self._update_status()
+
+    def _flush_pending_trans(self) -> None:
+        """Apply translations that arrived before their slots were registered.
+
+        Called via set_timer(0) so it runs after all _finalise_source calls
+        for the current batch of segments have completed and all slots are
+        registered at their correct positions.
+        """
+        for row_id, (translation, from_lang, confidence) in list(
+            self._pending_trans.items()
+        ):
+            if row_id in self._trans_slots:
+                self._pending_trans.pop(row_id)
+                self._update_translation_row(
+                    row_id, translation, True, from_lang, confidence
+                )
 
     def _update_translation_row(
         self,
