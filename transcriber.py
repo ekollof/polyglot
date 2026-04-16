@@ -173,7 +173,10 @@ _NOISE_TOKEN_RE = _re.compile(
 # hallucinations.  Whisper's own threshold is -1.0; music hallucinations
 # typically cluster in [-0.65, -1.0] while real speech sits above -0.6.
 # Log every skipped segment so the threshold can be tuned from polyglot.log.
-AVG_LOGPROB_THRESHOLD: float = -0.65
+# Set to -0.8 (was -0.65) so that foreign words embedded in an otherwise-English
+# utterance are not dropped: forced language="en" makes those segments score
+# poorly even when they contain real speech.
+AVG_LOGPROB_THRESHOLD: float = -0.8
 
 
 def _is_noise_token(text: str) -> bool:
@@ -855,7 +858,7 @@ class Transcriber:
                 fp16=self.device != "cpu",
                 temperature=(0.0, 0.2),
                 beam_size=1,
-                no_speech_threshold=0.7,
+                no_speech_threshold=1.0,  # disable internal suppression; our own filter handles it
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
                 initial_prompt=self._initial_prompt if use_initial_prompt else None,
@@ -1069,7 +1072,7 @@ class Transcriber:
                 fp16=self.device != "cpu",
                 temperature=(0.0, 0.2),
                 beam_size=1,
-                no_speech_threshold=0.7,
+                no_speech_threshold=1.0,  # disable internal suppression; our own filter handles it
                 logprob_threshold=-1.0,
                 compression_ratio_threshold=1.8,
                 initial_prompt=self._initial_prompt if use_initial_prompt else None,
