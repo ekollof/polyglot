@@ -1,17 +1,18 @@
 """
-translator.py — Two-tier offline/online translation.
+translator.py — Multi-engine translation with automatic fallback.
 
-Primary:  Google Translate via deep-translator (requires internet).
-Fallback: argostranslate (fully offline, pre-downloaded packages).
+Supported engines (selectable at runtime via set_engine()):
+  google        — Google Translate via deep-translator (needs internet)
+  mymemory      — MyMemory free API via deep-translator (needs internet)
+  libretranslate— LibreTranslate REST API; configurable base URL for
+                  self-hosted instances (needs internet or local server)
+  ollama        — Local LLM inference via Ollama REST API (offline, GPU)
+  argos         — argostranslate fully offline; packages downloaded on demand
 
-On every translate() call the primary is tried first.  If it raises any
-network-related exception (or any exception at all) the fallback is used
-instead and a flag is set so subsequent calls skip the primary until a
-connectivity probe succeeds again (checked in a background thread every 30s).
-
-argostranslate packages are downloaded on demand the first time a language
-pair is needed.  The download is non-blocking; the original text is returned
-while the package is fetched, after which future calls will use it.
+Fallback:
+  When the active online engine fails (network error / timeout), the call
+  falls through to argostranslate automatically.  A background probe restores
+  the primary engine after connectivity returns (every 30 s).
 """
 
 from __future__ import annotations
@@ -26,11 +27,29 @@ logger = logging.getLogger(__name__)
 
 StatusCallback = Callable[[str], None]
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Engine name constants — use these rather than bare strings.
+ENGINE_GOOGLE = "google"
+ENGINE_MYMEMORY = "mymemory"
+ENGINE_LIBRETRANSLATE = "libretranslate"
+ENGINE_OLLAMA = "ollama"
+ENGINE_ARGOS = "argos"
+
+_ONLINE_ENGINES = {ENGINE_GOOGLE, ENGINE_MYMEMORY, ENGINE_LIBRETRANSLATE}
+
 # How long to wait before re-probing connectivity after a failure (seconds).
 _CONNECTIVITY_RETRY_S = 30
 # Host used for the connectivity probe — just a DNS lookup, no HTTP.
 _PROBE_HOST = "translate.googleapis.com"
 
+# Default LibreTranslate public instance.
+_LIBRETRANSLATE_DEFAULT_URL = "https://libretranslate.com"
+# Ollama default endpoint and model.
+_OLLAMA_DEFAULT_URL = "http://localhost:11434"
+_OLLAMA_DEFAULT_MODEL = "mistral"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,20 +57,17 @@ _PROBE_HOST = "translate.googleapis.com"
 
 # Whisper uses standard ISO-639-1 codes, but Google Translate's API (via
 # deep-translator) uses a slightly different set for a handful of languages.
-# This table maps Whisper output codes → GoogleTranslator source/target codes.
 _GOOGLE_CODE: dict[str, str] = {
-    "zh": "zh-CN",  # Whisper returns 'zh'; Google needs 'zh-CN' or 'zh-TW'
-    "he": "iw",  # Whisper returns 'he'; Google uses the older code 'iw'
+    "zh": "zh-CN",
+    "he": "iw",
 }
 
 
 def _to_google_lang(code: str) -> str:
-    """Normalise a Whisper/ISO-639-1 language code to a GoogleTranslator code."""
     return _GOOGLE_CODE.get(code, code)
 
 
 def _is_online() -> bool:
-    """Return True if we can resolve Google's translate endpoint."""
     try:
         socket.setdefaulttimeout(2)
         socket.getaddrinfo(_PROBE_HOST, 443)
@@ -84,58 +100,100 @@ def _import_argo() -> None:
 
 class Translator:
     """
-    Translate text using Google Translate (online) with argostranslate fallback.
+    Multi-engine translator with automatic online/offline fallback.
 
-    Thread-safe; translate() may be called from any thread.
+    Call set_engine(name) to switch engines at runtime.  Thread-safe.
     """
 
-    def __init__(self, on_status: Optional[StatusCallback] = None):
+    def __init__(
+        self,
+        engine: str = ENGINE_GOOGLE,
+        on_status: Optional[StatusCallback] = None,
+        libretranslate_url: str = _LIBRETRANSLATE_DEFAULT_URL,
+        libretranslate_api_key: str = "",
+        ollama_url: str = _OLLAMA_DEFAULT_URL,
+        ollama_model: str = _OLLAMA_DEFAULT_MODEL,
+    ):
         self._on_status = on_status or (lambda s: None)
         self._lock = threading.Lock()
 
-        # Online state
+        # Engine selection
+        self._engine: str = engine
+
+        # Online state (relevant only when engine is an online engine)
         self._online: bool = _is_online()
         self._last_probe: float = time.monotonic()
+
+        # LibreTranslate config
+        self._libretranslate_url = libretranslate_url.rstrip("/")
+        self._libretranslate_api_key = libretranslate_api_key
+
+        # Ollama config
+        self._ollama_url = ollama_url.rstrip("/")
+        self._ollama_model = ollama_model
 
         # argostranslate package tracking
         self._installed_pairs: set[tuple[str, str]] = set()
         self._downloading: set[tuple[str, str]] = set()
 
-        logger.info("Translator initialised — online=%s", self._online)
+        logger.info(
+            "Translator initialised — engine=%s, online=%s", engine, self._online
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    def set_engine(self, engine: str) -> None:
+        """Switch the active translation engine.  Thread-safe."""
+        with self._lock:
+            self._engine = engine
+        logger.info("Translation engine changed to '%s'.", engine)
+        self._on_status(f"Translation engine: {engine}")
+
+    @property
+    def engine(self) -> str:
+        with self._lock:
+            return self._engine
+
     def translate(self, text: str, from_lang: str, to_lang: str, **_kwargs) -> str:
         """
-        Translate text from from_lang to to_lang.
+        Translate text from from_lang to to_lang using the active engine.
 
-        Extra keyword arguments (e.g. whisper_already_translated) are accepted
-        and silently ignored for API compatibility.
-
-        Returns translated text, or original text on unrecoverable failure.
+        Falls back to argostranslate on network failure for online engines.
+        Returns original text on unrecoverable failure.
         """
         if not text.strip():
             return text
         if from_lang == to_lang:
             return text
 
-        # Try Google first if we believe we're online.
+        with self._lock:
+            engine = self._engine
+
+        if engine == ENGINE_ARGOS:
+            return self._argo_translate(text, from_lang, to_lang)
+
+        if engine == ENGINE_OLLAMA:
+            result = self._ollama_translate(text, from_lang, to_lang)
+            return result if result is not None else text
+
+        # Online engine — try primary, fall back to argos on failure.
         if self._check_online():
-            result = self._google_translate(text, from_lang, to_lang)
+            result = self._call_online_engine(engine, text, from_lang, to_lang)
             if result is not None:
                 return result
-            # Google failed — mark offline and fall through.
+            # Mark offline and fall through.
             with self._lock:
                 self._online = False
                 self._last_probe = time.monotonic()
             logger.warning(
-                "Google Translate failed (%s→%s), falling back to argostranslate.",
+                "%s failed (%s→%s), falling back to argostranslate.",
+                engine,
                 from_lang,
                 to_lang,
             )
-            self._on_status("Google Translate unavailable — using offline fallback")
+            self._on_status(f"{engine} unavailable — using offline fallback")
 
         return self._argo_translate(text, from_lang, to_lang)
 
@@ -145,23 +203,15 @@ class Translator:
         to_lang: str,
         blocking: bool = False,
     ) -> bool:
-        """
-        Ensure the argostranslate package for (from_lang→to_lang) is installed.
-
-        Returns True if already installed, False if a download was started.
-        Downloads happen in a background thread unless blocking=True.
-        """
         if from_lang == to_lang:
             return True
         if self._argo_is_installed(from_lang, to_lang):
             return True
-
         pair = (from_lang, to_lang)
         with self._lock:
             if pair in self._downloading:
                 return False
             self._downloading.add(pair)
-
         t = threading.Thread(
             target=self._argo_download,
             args=(from_lang, to_lang),
@@ -174,7 +224,6 @@ class Translator:
         return False
 
     def installed_languages(self) -> list[str]:
-        """Return language codes for installed argostranslate packages."""
         try:
             _import_argo()
             import argostranslate.translate as at
@@ -189,11 +238,9 @@ class Translator:
     # ------------------------------------------------------------------
 
     def _check_online(self) -> bool:
-        """Return current online belief; re-probe if enough time has passed."""
         with self._lock:
             online = self._online
             elapsed = time.monotonic() - self._last_probe
-
         if not online and elapsed >= _CONNECTIVITY_RETRY_S:
             now_online = _is_online()
             with self._lock:
@@ -201,12 +248,27 @@ class Translator:
                 self._last_probe = time.monotonic()
             if now_online:
                 logger.info(
-                    "Connectivity restored — switching back to Google Translate."
+                    "Connectivity restored — switching back to %s.", self._engine
                 )
-                self._on_status("Online — Google Translate resumed")
+                self._on_status(f"Online — {self._engine} resumed")
             return now_online
-
         return online
+
+    # ------------------------------------------------------------------
+    # Engine dispatch
+    # ------------------------------------------------------------------
+
+    def _call_online_engine(
+        self, engine: str, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        if engine == ENGINE_GOOGLE:
+            return self._google_translate(text, from_lang, to_lang)
+        if engine == ENGINE_MYMEMORY:
+            return self._mymemory_translate(text, from_lang, to_lang)
+        if engine == ENGINE_LIBRETRANSLATE:
+            return self._libretranslate_translate(text, from_lang, to_lang)
+        logger.warning("Unknown engine '%s', using Google.", engine)
+        return self._google_translate(text, from_lang, to_lang)
 
     # ------------------------------------------------------------------
     # Google Translate
@@ -215,16 +277,102 @@ class Translator:
     def _google_translate(
         self, text: str, from_lang: str, to_lang: str
     ) -> Optional[str]:
-        """Call Google Translate. Returns None on any error."""
         try:
             from deep_translator import GoogleTranslator
 
-            g_from = _to_google_lang(from_lang)
-            g_to = _to_google_lang(to_lang)
-            result = GoogleTranslator(source=g_from, target=g_to).translate(text)
+            result = GoogleTranslator(
+                source=_to_google_lang(from_lang),
+                target=_to_google_lang(to_lang),
+            ).translate(text)
             return result or None
         except Exception as exc:
             logger.debug("Google Translate error (%s→%s): %s", from_lang, to_lang, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # MyMemory
+    # ------------------------------------------------------------------
+
+    def _mymemory_translate(
+        self, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        try:
+            from deep_translator import MyMemoryTranslator
+
+            result = MyMemoryTranslator(
+                source=from_lang,
+                target=to_lang,
+            ).translate(text)
+            if isinstance(result, list):
+                result = " ".join(result)
+            return result or None
+        except Exception as exc:
+            logger.debug("MyMemory error (%s→%s): %s", from_lang, to_lang, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # LibreTranslate
+    # ------------------------------------------------------------------
+
+    def _libretranslate_translate(
+        self, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        try:
+            import requests  # system-wide
+
+            payload: dict = {"q": text, "source": from_lang, "target": to_lang}
+            if self._libretranslate_api_key:
+                payload["api_key"] = self._libretranslate_api_key
+            resp = requests.post(
+                f"{self._libretranslate_url}/translate",
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("translatedText") or None
+        except Exception as exc:
+            logger.debug("LibreTranslate error (%s→%s): %s", from_lang, to_lang, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Ollama (local LLM)
+    # ------------------------------------------------------------------
+
+    def _ollama_translate(
+        self, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        """Translate via a local Ollama model.  No fallback — offline by design."""
+        try:
+            import requests  # system-wide
+
+            # Language display names for a more natural prompt.
+            from_name = _LANG_NAMES.get(from_lang, from_lang)
+            to_name = _LANG_NAMES.get(to_lang, to_lang)
+            prompt = (
+                f"Translate the following {from_name} text to {to_name}. "
+                f"Output ONLY the translation with no explanation, no quotes, "
+                f"no prefix, no extra words.\n\n"
+                f"Text: {text}\n\nTranslation:"
+            )
+            resp = requests.post(
+                f"{self._ollama_url}/api/generate",
+                json={
+                    "model": self._ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("response", "").strip()
+            # Strip any leading/trailing quotes the model might add.
+            if result and result[0] in ('"', "'") and result[-1] == result[0]:
+                result = result[1:-1].strip()
+            return result or None
+        except Exception as exc:
+            logger.debug("Ollama error (%s→%s): %s", from_lang, to_lang, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -232,7 +380,6 @@ class Translator:
     # ------------------------------------------------------------------
 
     def _argo_translate(self, text: str, from_lang: str, to_lang: str) -> str:
-        """Translate via argostranslate. Returns original text on failure."""
         if not self._argo_is_installed(from_lang, to_lang):
             self.ensure_package(from_lang, to_lang)
             logger.debug(
@@ -241,7 +388,6 @@ class Translator:
                 to_lang,
             )
             return text
-
         try:
             _import_argo()
             import argostranslate.translate as at
@@ -304,3 +450,74 @@ class Translator:
             with self._lock:
                 self._downloading.discard(pair)
             self._on_status(f"Package download failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Language display names (for Ollama prompt)
+# ---------------------------------------------------------------------------
+
+_LANG_NAMES: dict[str, str] = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "tr": "Turkish",
+    "pl": "Polish",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "no": "Norwegian",
+    "cs": "Czech",
+    "sk": "Slovak",
+    "hu": "Hungarian",
+    "ro": "Romanian",
+    "bg": "Bulgarian",
+    "hr": "Croatian",
+    "sr": "Serbian",
+    "uk": "Ukrainian",
+    "el": "Greek",
+    "he": "Hebrew",
+    "fa": "Persian",
+    "vi": "Vietnamese",
+    "th": "Thai",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "ca": "Catalan",
+    "la": "Latin",
+    "af": "Afrikaans",
+    "sq": "Albanian",
+    "hy": "Armenian",
+    "az": "Azerbaijani",
+    "eu": "Basque",
+    "be": "Belarusian",
+    "bn": "Bengali",
+    "bs": "Bosnian",
+    "gl": "Galician",
+    "ka": "Georgian",
+    "gu": "Gujarati",
+    "ht": "Haitian Creole",
+    "is": "Icelandic",
+    "mk": "Macedonian",
+    "ml": "Malayalam",
+    "mr": "Marathi",
+    "mn": "Mongolian",
+    "ne": "Nepali",
+    "pa": "Punjabi",
+    "si": "Sinhala",
+    "sl": "Slovenian",
+    "sw": "Swahili",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "tl": "Filipino",
+    "ur": "Urdu",
+    "uz": "Uzbek",
+}

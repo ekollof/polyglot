@@ -46,7 +46,14 @@ from textual import work
 
 from audio import AudioCapture, list_input_devices, default_device
 from transcriber import Transcriber
-from translator import Translator
+from translator import (
+    Translator,
+    ENGINE_GOOGLE,
+    ENGINE_MYMEMORY,
+    ENGINE_LIBRETRANSLATE,
+    ENGINE_OLLAMA,
+    ENGINE_ARGOS,
+)
 
 logging.basicConfig(
     filename="/tmp/polyglot.log",
@@ -178,8 +185,16 @@ TARGET_LANGUAGES: list[tuple[str, str]] = sorted(
     LANGUAGE_NAMES.items(), key=lambda x: x[1]
 )  # sorted by display name
 
+# Translation engines available in the UI.
+TRANSLATION_ENGINES: list[tuple[str, str]] = [
+    ("Google", ENGINE_GOOGLE),
+    ("MyMemory", ENGINE_MYMEMORY),
+    ("LibreTranslate", ENGINE_LIBRETRANSLATE),
+    ("Ollama (local)", ENGINE_OLLAMA),
+    ("Argos (offline)", ENGINE_ARGOS),
+]
+
 # Whisper models in order from fastest/smallest to slowest/largest.
-#
 # Model      Params   VRAM    Relative speed   Notes
 # ---------  -------  ------  ---------------  -----------------------------------
 # tiny       ~39 M    ~1 GB   ~32×             English-only variant available.
@@ -316,6 +331,10 @@ RichLog {
     width: 20;
 }
 
+#engine-select {
+    width: 20;
+}
+
 #clear-btn {
     width: auto;
     margin-left: 1;
@@ -358,22 +377,14 @@ class TranslationWorker:
     The worker pops jobs, calls Translator.translate(), and delivers results
     via a callback on the main thread using call_from_thread.
 
-    Each job carries a generation counter so that stale interim-translation
-    results (queued for a partial that was already superseded) can be
-    discarded cheaply.
+    Stale partial jobs are drained before each translation call: if a newer
+    partial for the same row_id is already queued, or a final for that row_id
+    exists in the queue, the older partial is silently discarded.  This keeps
+    the displayed partial translation up-to-date without ever blocking the
+    transcription thread.
     """
 
     def __init__(self, translator: Translator, on_translated):
-        """
-        Parameters
-        ----------
-        translator:
-            The shared Translator instance (thread-safe).
-        on_translated:
-            Callable(row_id, translation, is_final) called with the result.
-            row_id matches the value passed to submit().
-            is_final is True for final utterance results, False for partials.
-        """
         self._translator = translator
         self._on_translated = on_translated
         self._queue: queue.Queue = queue.Queue()
@@ -400,23 +411,61 @@ class TranslationWorker:
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
-            if item is _STOP_SENTINEL:
+            # Block until at least one item arrives.
+            first = self._queue.get()
+            if first is _STOP_SENTINEL:
                 break
-            row_id, text, from_lang, to_lang, is_final, confidence = item
-            # Skip the API call when the detected source language is already the
-            # target language — just echo the transcription verbatim.
-            if from_lang == to_lang:
+
+            # Drain any additional pending items without blocking.
+            batch = [first]
+            try:
+                while True:
+                    batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                pass
+
+            # Check for stop sentinel in drained batch.
+            if any(x is _STOP_SENTINEL for x in batch):
+                break
+
+            # For each row_id, keep only the latest partial; keep all finals.
+            # If a final exists for a row_id, skip any partial for that row too.
+            latest_partial: dict[int, tuple] = {}
+            finals_by_row: set[int] = set()
+            finals_ordered: list[tuple] = []
+
+            for item in batch:
+                r_id, _, _, _, is_final, _ = item
+                if is_final:
+                    finals_by_row.add(r_id)
+                    finals_ordered.append(item)
+                else:
+                    latest_partial[r_id] = item  # overwrite: newer wins
+
+            # Process: latest partial per row (unless superseded by a final),
+            # then all finals in arrival order.
+            to_process: list[tuple] = []
+            for r_id, item in latest_partial.items():
+                if r_id not in finals_by_row:
+                    to_process.append(item)
+            to_process.extend(finals_ordered)
+
+            for item in to_process:
+                self._translate_item(item)
+
+    def _translate_item(self, item: tuple) -> None:
+        row_id, text, from_lang, to_lang, is_final, confidence = item
+        if from_lang == to_lang:
+            translated = text
+        else:
+            try:
+                translated = self._translator.translate(
+                    text, from_lang=from_lang, to_lang=to_lang
+                )
+            except Exception as exc:
+                logger.error("Translation error: %s", exc)
                 translated = text
-            else:
-                try:
-                    translated = self._translator.translate(
-                        text, from_lang=from_lang, to_lang=to_lang
-                    )
-                except Exception as exc:
-                    logger.error("Translation error: %s", exc)
-                    translated = text
-            self._on_translated(row_id, translated, is_final, from_lang, confidence)
+        self._on_translated(row_id, translated, is_final, from_lang, confidence)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +486,7 @@ class PolyglotApp(App):
         Binding("l", "focus_source", "Audio source"),
         Binding("t", "focus_target", "Target lang"),
         Binding("m", "focus_model", "Model"),
+        Binding("e", "focus_engine", "Engine"),
     ]
 
     def __init__(self) -> None:
@@ -451,6 +501,7 @@ class PolyglotApp(App):
         self._target_lang: str = "en"
         self._detected_lang: str = "?"
         self._model_name: str = "turbo"
+        self._engine: str = ENGINE_GOOGLE
         self._model_ready = False
 
         # Row tracking for in-place partial updates.
@@ -514,6 +565,12 @@ class PolyglotApp(App):
                     options=[(label, key) for key, label in WHISPER_MODELS],
                     value="turbo",
                     id="model-select",
+                )
+                yield Label("  Translate:", classes="control-label")
+                yield Select(
+                    options=[(label, key) for label, key in TRANSLATION_ENGINES],
+                    value=ENGINE_GOOGLE,
+                    id="engine-select",
                 )
                 yield Button("Clear", id="clear-btn", variant="default")
 
@@ -609,6 +666,19 @@ class PolyglotApp(App):
         self._detected_lang = detected_lang
         row_id = self._next_row_id  # reuse the same row until finalised
         self.call_from_thread(self._show_partial, row_id, partial_text, detected_lang)
+
+        # Also submit a partial translation so the translation pane shows live
+        # text rather than a static "…" placeholder.
+        target = self._target_lang
+        if partial_text and detected_lang != "?" and self._translation_worker:
+            self._translation_worker.submit(
+                row_id=row_id,
+                text=partial_text,
+                from_lang=detected_lang,
+                to_lang=target,
+                is_final=False,
+                confidence=confidence,
+            )
 
     def _on_transcription_result(
         self,
@@ -782,22 +852,32 @@ class PolyglotApp(App):
     ) -> None:
         """Replace the translation placeholder with the actual translation.
 
-        Uses the per-row slot registered in _finalise_source so that
-        translations arriving after the next utterance has already started
-        are not dropped.
+        For partial (is_final=False) results: updates the dim partial line in
+        the translation pane if the utterance is still in-progress.
 
-        Multiple segments from the same commit each have their own slot.
-        Lines added after slot_start (other slots' "…" placeholders and any
-        dim partial) are all saved, removed, the placeholder is rewritten,
-        then everything is re-appended.  All slot indices and _trans_strip_start
-        are updated to reflect the new positions so that subsequent calls
-        remain consistent.
+        For final results: uses the per-row slot registered in _finalise_source
+        so that translations arriving after the next utterance has already
+        started are not dropped.
         """
+        trans_log = self.query_one("#translation-log", RichLog)
+
+        # ── Partial translation: update the dim "…" live ────────────────
+        if not is_final:
+            if self._pending_row_id == row_id:
+                # Replace just the dim partial translation line.
+                self._pop_partial(trans_log, self._trans_strip_start)
+                line = _make_lang_tag_line(
+                    translation, from_lang, confidence, is_final=False
+                )
+                trans_log.write(line)
+            # If row is no longer pending, the final translation is already in
+            # flight — discard this stale partial result.
+            return
+
+        # ── Final translation: slot-based in-place update ────────────────
         slot_start = self._trans_slots.get(row_id)
         if slot_start is None:
             return  # row was cleared or never registered
-
-        trans_log = self.query_one("#translation-log", RichLog)
 
         # Save ALL lines that come after slot_start (subsequent slots'
         # placeholders + any dim partial).  We must restore them so that later
@@ -888,6 +968,14 @@ class PolyglotApp(App):
                 self._model_name = new_model
                 self._restart_transcriber()
 
+        elif event.select.id == "engine-select":
+            if event.value is Select.BLANK:
+                return
+            new_engine = str(event.value)
+            if new_engine != self._engine:
+                self._engine = new_engine
+                self._translator.set_engine(new_engine)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "clear-btn":
             self.action_clear()
@@ -915,6 +1003,9 @@ class PolyglotApp(App):
 
     def action_focus_model(self) -> None:
         self.query_one("#model-select").focus()
+
+    def action_focus_engine(self) -> None:
+        self.query_one("#engine-select").focus()
 
     # ------------------------------------------------------------------
     # Status bar helpers
