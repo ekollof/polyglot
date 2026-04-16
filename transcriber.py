@@ -769,6 +769,19 @@ class Transcriber:
                             conf2,
                             self._detected_lang,
                         )
+                        # Detector saw a different language twice — reduce cached
+                        # confidence so the next commit uses Whisper auto-detect
+                        # on the full utterance audio instead of forcing the stale
+                        # language.  Auto-detect on 5-7 s is far more reliable than
+                        # the 3 s snapshot used here.
+                        if self._detected_confidence is not None:
+                            self._detected_confidence = min(
+                                self._detected_confidence, 0.69
+                            )
+                            logger.debug(
+                                "Confidence capped to %.2f — next commit will auto-detect.",
+                                self._detected_confidence,
+                            )
                 else:
                     logger.debug(
                         "Language detection rejected — ambiguous (%.2f) and audio "
@@ -776,6 +789,12 @@ class Transcriber:
                         confidence,
                         self._detected_lang,
                     )
+                    if self._detected_confidence is not None:
+                        self._detected_confidence = min(self._detected_confidence, 0.69)
+                        logger.debug(
+                            "Confidence capped to %.2f — next commit will auto-detect.",
+                            self._detected_confidence,
+                        )
             else:
                 logger.debug(
                     "Language detection rejected — confidence %.2f < %.2f; keeping %s.",
@@ -783,6 +802,15 @@ class Transcriber:
                     MIN_AMBIGUOUS,
                     self._detected_lang,
                 )
+                # Even a below-threshold signal for a *different* language is a
+                # reason to be less certain.  Cap confidence so the commit path
+                # falls back to Whisper auto-detect on the full audio.
+                if self._detected_confidence is not None and confidence >= 0.45:
+                    self._detected_confidence = min(self._detected_confidence, 0.69)
+                    logger.debug(
+                        "Confidence capped to %.2f — next commit will auto-detect.",
+                        self._detected_confidence,
+                    )
 
         except Exception as exc:
             logger.error("Language detection error: %s", exc, exc_info=True)
@@ -1443,13 +1471,18 @@ class Transcriber:
                     )
 
                 # Reset buffer; keep _speech_active=True and VAD state running.
-                # _detection_triggered stays True — language is still valid.
+                # Reset _detection_triggered so the next rolling window re-detects
+                # after DETECT_SECONDS of speech.  This is essential for language
+                # switching during continuous speech (e.g. Arabic → English) — the
+                # detection from the first window cannot be assumed valid for all
+                # subsequent rolling windows.
                 utterance = []
                 utterance_samples = 0
                 _speech_sample_offset = 0
+                _detection_triggered = False
                 _utterance_start_time = time.monotonic()
                 _last_interim_time = _utterance_start_time
-                # Keep _vad_lang: detection result still valid for next chunk.
+                # Keep _vad_lang: detection result still valid until overridden.
 
             # ── Safety cap (wall-clock) ─────────────────────────────────
             elif (
