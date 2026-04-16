@@ -22,6 +22,7 @@ from suppress_alsa import prewarm_tqdm_lock
 
 prewarm_tqdm_lock()
 
+import concurrent.futures
 import logging
 import queue
 import threading
@@ -365,33 +366,31 @@ RichLog {
 # Translation worker
 # ---------------------------------------------------------------------------
 
-# Sentinel pushed into the translation queue to stop the worker thread.
-_STOP_SENTINEL = object()
-
 
 class TranslationWorker:
     """
-    Runs translation in a dedicated background thread.
+    Runs translations concurrently using a thread pool.
 
-    The transcription thread pushes jobs into a queue and returns immediately.
-    The worker pops jobs, calls Translator.translate(), and delivers results
-    via a callback on the main thread using call_from_thread.
+    Each submitted job is dispatched immediately to a ThreadPoolExecutor so
+    that slow or stalled HTTP requests (Google Translate, etc.) never block
+    other pending translations.  Results are delivered to the main thread via
+    call_from_thread in whatever order they complete.
 
-    Stale partial jobs are drained before each translation call: if a newer
-    partial for the same row_id is already queued, or a final for that row_id
-    exists in the queue, the older partial is silently discarded.  This keeps
-    the displayed partial translation up-to-date without ever blocking the
-    transcription thread.
+    Only finals are ever submitted (partials are not translated).
     """
+
+    # Maximum concurrent translation requests.  4 is enough to absorb burst
+    # commits (which can emit 3–5 segments at once) without hammering the
+    # translation service.
+    _MAX_WORKERS = 4
 
     def __init__(self, translator: Translator, on_translated):
         self._translator = translator
         self._on_translated = on_translated
-        self._queue: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="TranslationWorker"
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._MAX_WORKERS,
+            thread_name_prefix="TranslationWorker",
         )
-        self._thread.start()
 
     def submit(
         self,
@@ -402,37 +401,14 @@ class TranslationWorker:
         is_final: bool,
         confidence: Optional[float] = None,
     ) -> None:
-        """Queue a translation job."""
-        self._queue.put((row_id, text, from_lang, to_lang, is_final, confidence))
+        """Dispatch a translation job to the thread pool."""
+        self._executor.submit(
+            self._translate_item,
+            (row_id, text, from_lang, to_lang, is_final, confidence),
+        )
 
     def stop(self) -> None:
-        self._queue.put(_STOP_SENTINEL)
-        self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        while True:
-            # Block until at least one item arrives.
-            first = self._queue.get()
-            if first is _STOP_SENTINEL:
-                break
-
-            # Drain any additional pending items without blocking.
-            batch = [first]
-            try:
-                while True:
-                    batch.append(self._queue.get_nowait())
-            except queue.Empty:
-                pass
-
-            # Check for stop sentinel in drained batch.
-            if any(x is _STOP_SENTINEL for x in batch):
-                break
-
-            # Only finals are submitted (partials are never translated).
-            # Process all items in arrival order.
-            for item in batch:
-                if item is not _STOP_SENTINEL:
-                    self._translate_item(item)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _translate_item(self, item: tuple) -> None:
         row_id, text, from_lang, to_lang, is_final, confidence = item
