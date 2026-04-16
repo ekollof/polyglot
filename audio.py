@@ -172,6 +172,7 @@ class AudioCapture:
     def __init__(self, device_index: int, audio_queue: Optional[queue.Queue] = None):
         self.queue: queue.Queue[np.ndarray] = audio_queue or queue.Queue(maxsize=200)
         self._device_index = device_index
+        self._device_name: str = ""
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._switch_event = threading.Event()
@@ -206,6 +207,7 @@ class AudioCapture:
         """Hot-switch to a different input device."""
         with self._lock:
             self._device_index = device_index
+            self._device_name = ""  # will be resolved in _stream_device
         self._switch_event.set()
 
     # ------------------------------------------------------------------
@@ -216,19 +218,50 @@ class AudioCapture:
         while not self._stop_event.is_set():
             with self._lock:
                 idx = self._device_index
+                name = self._device_name
             self._switch_event.clear()
             try:
                 self._stream_device(idx)
             except Exception as exc:
                 logger.warning(
-                    "AudioCapture error on device %d: %s — retrying in 1 s", idx, exc
+                    "AudioCapture error on device %d (%s): %s", idx, name, exc
                 )
-                self._stop_event.wait(1.0)
+                # If the device has a known name (e.g. an app stream that
+                # de-registered), poll until it reappears under any index.
+                # For a user-requested switch (_switch_event already set) or
+                # a permanent device, fall back to a simple 1 s delay.
+                if name and not self._switch_event.is_set():
+                    self._reconnect_by_name(name)
+                else:
+                    self._stop_event.wait(1.0)
+
+    def _reconnect_by_name(self, name: str) -> None:
+        """Block until a device with *name* reappears, then update _device_index."""
+        logger.info("Waiting for device '%s' to reappear…", name)
+        while not self._stop_event.is_set() and not self._switch_event.is_set():
+            try:
+                for i, info in enumerate(sd.query_devices()):
+                    if info["name"] == name and int(info["max_input_channels"]) > 0:
+                        with self._lock:
+                            self._device_index = i
+                        logger.info(
+                            "Device '%s' reappeared at index %d — reconnecting",
+                            name,
+                            i,
+                        )
+                        return
+            except Exception as exc:
+                logger.debug("query_devices error while waiting: %s", exc)
+            self._stop_event.wait(1.0)
 
     def _stream_device(self, device_index: int) -> None:
         info = sd.query_devices(device_index)
         native_rate = int(info["default_samplerate"])
         native_channels = min(int(info["max_input_channels"]), 2)
+
+        # Record the name so _run() can reconnect by name if the device drops.
+        with self._lock:
+            self._device_name = info["name"]
 
         # Compute resample ratio once.
         g = gcd(WHISPER_RATE, native_rate)
