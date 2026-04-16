@@ -176,7 +176,12 @@ _NOISE_TOKEN_RE = _re.compile(
 # Set to -0.8 (was -0.65) so that foreign words embedded in an otherwise-English
 # utterance are not dropped: forced language="en" makes those segments score
 # poorly even when they contain real speech.
-AVG_LOGPROB_THRESHOLD: float = -0.8
+AVG_LOGPROB_THRESHOLD: float = -0.95
+
+# Seconds since the last confident language confirmation before we treat
+# _detected_lang as stale and clear it.  Prevents a wrong language from
+# lingering when subsequent detections keep falling below the confidence bar.
+LANG_STALE_SECONDS: float = 30.0
 
 
 def _is_noise_token(text: str) -> bool:
@@ -359,6 +364,9 @@ class Transcriber:
         # single-reference writes/reads of simple objects atomic, so no lock needed.
         self._detected_lang: Optional[str] = None  # inference thread only
         self._detected_confidence: Optional[float] = None  # inference thread only
+        self._detected_lang_set_at: float = (
+            0.0  # monotonic time when _detected_lang was last confirmed
+        )
         self._vad_lang: Optional[str] = None  # shared, GIL-atomic
 
         # SpeechBrain LangID results — written by LangID thread, read by
@@ -628,6 +636,11 @@ class Transcriber:
     def _infer_detect(self, model, audio: np.ndarray) -> None:
         """Run detect_language and update _detected_lang / _vad_lang.
 
+        A staleness check at the top clears _detected_lang if it has not been
+        confirmed by a confident detection for more than LANG_STALE_SECONDS.
+        This prevents a wrong language (e.g. 'uk' detected on noisy audio)
+        from persisting indefinitely when subsequent detections lack confidence.
+
         Confidence thresholds
         ---------------------
         >= 0.80  — accept immediately (high confidence).
@@ -640,6 +653,27 @@ class Transcriber:
                     while still rejecting noisy low-confidence flips.
         < 0.65   — reject outright; keep current language.
         """
+        import time as _time
+
+        # Staleness check: if _detected_lang hasn't been confirmed by a
+        # confident detection within LANG_STALE_SECONDS, clear it so the next
+        # commit auto-detects from scratch instead of being forced into the
+        # wrong language.
+        if (
+            self._detected_lang is not None
+            and self._detected_lang_set_at > 0.0
+            and (_time.monotonic() - self._detected_lang_set_at) > LANG_STALE_SECONDS
+        ):
+            logger.debug(
+                "Language '%s' stale (>%.0fs without confident confirmation) — clearing.",
+                self._detected_lang,
+                LANG_STALE_SECONDS,
+            )
+            self._detected_lang = None
+            self._detected_confidence = None
+            self._detected_lang_set_at = 0.0
+            self._vad_lang = None
+
         try:
             import whisper as _whisper
 
@@ -709,6 +743,7 @@ class Transcriber:
                 if confidence >= MIN_AMBIGUOUS:
                     self._detected_lang = lang
                     self._detected_confidence = confidence
+                    self._detected_lang_set_at = _time.monotonic()
                     self._vad_lang = lang
                 elif confidence < 0.40:
                     # Very low confidence even for the cached language means
@@ -735,6 +770,7 @@ class Transcriber:
                 # High-confidence switch to a different language — accept.
                 self._detected_lang = lang
                 self._detected_confidence = confidence
+                self._detected_lang_set_at = _time.monotonic()
                 self._vad_lang = lang
             elif confidence >= MIN_AMBIGUOUS:
                 # Ambiguous zone: the detected lang differs from current and
@@ -761,6 +797,7 @@ class Transcriber:
                         )
                         self._detected_lang = lang
                         self._detected_confidence = combined
+                        self._detected_lang_set_at = _time.monotonic()
                         self._vad_lang = lang
                     else:
                         logger.debug(
@@ -834,20 +871,11 @@ class Transcriber:
                 "Partial — lang not yet detected, letting Whisper auto-detect."
             )
 
-        # Only force language if detection was confident — same rule as commits.
-        _PARTIAL_LANG_MIN_CONFIDENCE = 0.70
-        partial_lang: Optional[str] = (
-            lang
-            if lang is not None
-            and self._detected_confidence is not None
-            and self._detected_confidence >= _PARTIAL_LANG_MIN_CONFIDENCE
-            else None
-        )
-        use_initial_prompt = (
-            bool(self._initial_prompt)
-            and partial_lang is not None
-            and self._initial_prompt_lang == partial_lang
-        )
+        # Never force language on partials — let Whisper auto-detect per window.
+        # Forcing a stale or wrong detected language causes Whisper to translate
+        # instead of transcribe, or output garbage when the language changes.
+        partial_lang: Optional[str] = None
+        use_initial_prompt = False
 
         audio = _normalize_audio(audio, rms)
         try:
