@@ -524,6 +524,15 @@ class PolyglotApp(App):
         self._trans_slots: dict[int, int] = {}  # row_id → strip_start
         self._trans_slot_order: list[int] = []  # insertion order of row_ids
 
+        # Final translations that arrived before their slot was registered.
+        # Race: translation worker can deliver a result before _finalise_source
+        # runs on the main thread (both use call_from_thread from different
+        # threads, ordering not guaranteed).  We hold them here and apply
+        # immediately when _finalise_source registers the slot.
+        self._pending_trans: dict[
+            int, tuple
+        ] = {}  # row_id → (translation, from_lang, confidence)
+
         # Last finalised source text, used as context for the next translation
         # so the translator can resolve sentence continuations and pronouns.
         self._last_source_text: str = ""  # retained for potential future use
@@ -838,6 +847,14 @@ class PolyglotApp(App):
         # interim result arrives.
         self._pending_row_id = None
 
+        # Apply any translation that arrived before the slot was registered
+        # (race: translation worker → call_from_thread may beat this call).
+        if row_id in self._pending_trans:
+            translation, from_lang, confidence = self._pending_trans.pop(row_id)
+            self._update_translation_row(
+                row_id, translation, True, from_lang, confidence
+            )
+
         self._row_count += 1
         self._detected_lang = detected_lang
         self._update_status()
@@ -880,7 +897,11 @@ class PolyglotApp(App):
         # ── Final translation: slot-based in-place update ────────────────
         slot_start = self._trans_slots.get(row_id)
         if slot_start is None:
-            return  # row was cleared or never registered
+            # Slot not yet registered — _finalise_source hasn't run yet on the
+            # main thread.  Stash and apply when it does.
+            if row_id not in self._pending_trans:
+                self._pending_trans[row_id] = (translation, from_lang, confidence)
+            return
 
         # Save ALL lines that come after slot_start (subsequent slots'
         # placeholders + any dim partial).  We must restore them so that later
