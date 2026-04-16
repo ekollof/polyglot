@@ -18,6 +18,7 @@ from math import gcd
 from typing import Optional
 
 import numpy as np
+import pulsectl
 import sounddevice as sd
 from scipy.signal import resample_poly
 
@@ -35,30 +36,94 @@ _NEVER_DEFAULT = {"pipewire", "jack", "pulse", "default"}
 _BAD_SUBSTRINGS = ("(hw:", "hw:")
 _BAD_KEYWORDS_DEFAULT = ("input", "webcam", "brio", "c920", "split", " 0")
 
+_VIRTUAL_NAMES = {"pipewire", "jack", "pulse", "default"}
 
-def _device_is_usable(info: dict) -> bool:
-    """Return True if this device is safe to open under PipeWire."""
-    if int(info["max_input_channels"]) < 1:
-        return False
-    name_lower = info["name"].lower()
-    # Exclude raw hw: ALSA devices (claimed by PipeWire, cause conflicts)
-    if any(s in name_lower for s in _BAD_SUBSTRINGS):
-        return False
-    return True
+
+def _pulse_source_classes() -> dict:
+    """Return {lowercased_description: 'monitor'|'sound'} for all PulseAudio sources.
+
+    Monitor sources are also keyed by their stripped name (without the
+    "Monitor of " prefix) since sounddevice exposes them under that shorter name.
+    """
+    result: dict = {}
+    try:
+        with pulsectl.Pulse("polyglot-probe") as pulse:
+            for src in pulse.source_list():
+                desc = src.description or ""
+                cls = src.proplist.get("device.class", "sound")
+                result[desc.lower()] = cls
+                if desc.lower().startswith("monitor of "):
+                    stripped = desc[len("Monitor of ") :].lower()
+                    result[stripped] = "monitor"
+    except Exception as exc:
+        logger.warning("pulsectl source_list failed: %s", exc)
+    logger.debug("pulse source classes: %s", result)
+    return result
+
+
+def _pulse_app_names() -> set:
+    """Return a set of lowercased application names currently playing audio.
+
+    Uses sink_input_list() which lists active audio streams from apps
+    (Brave, Firefox, mpv, etc.) via the PulseAudio compatibility layer.
+    """
+    names: set = set()
+    try:
+        with pulsectl.Pulse("polyglot-probe") as pulse:
+            for si in pulse.sink_input_list():
+                app = si.proplist.get("application.name") or si.proplist.get(
+                    "node.name", ""
+                )
+                if app:
+                    names.add(app.lower())
+    except Exception as exc:
+        logger.warning("pulsectl sink_input_list failed: %s", exc)
+    logger.debug("pulse app names: %s", names)
+    return names
+
+
+def _classify_device(name: str, source_classes: dict, app_names: set) -> str:
+    """Return 'app' | 'monitor' | 'sound' for a sounddevice input name."""
+    key = name.lower()
+    cls = source_classes.get(key)
+    if cls == "monitor":
+        return "monitor"
+    if cls == "sound":
+        return "sound"
+    # Only confirmed active sink inputs are real app streams.
+    # Everything else (Split nodes, numbered virtual nodes, etc.) → hardware input.
+    if key in app_names:
+        return "app"
+    return "sound"
 
 
 def list_input_devices() -> list[dict]:
-    """Return usable input devices as a list of dicts."""
+    """Return usable input devices as a list of dicts with a 'group' field.
+
+    group is one of: 'app' | 'monitor' | 'sound'
+    """
+    source_classes = _pulse_source_classes()
+    app_names = _pulse_app_names()
     devices = []
     for i, info in enumerate(sd.query_devices()):
-        if not _device_is_usable(info):
+        if int(info["max_input_channels"]) < 1:
             continue
+        name = info["name"]
+        name_lower = name.lower()
+        # Exclude raw hw: ALSA devices
+        if any(s in name_lower for s in _BAD_SUBSTRINGS):
+            continue
+        # Exclude generic virtual sinks
+        if name_lower in _VIRTUAL_NAMES:
+            continue
+        group = _classify_device(name, source_classes, app_names)
         devices.append(
             {
                 "index": i,
-                "name": info["name"],
+                "name": name,
                 "rate": int(info["default_samplerate"]),
                 "channels": int(info["max_input_channels"]),
+                "group": group,
             }
         )
     return devices
@@ -134,7 +199,7 @@ class AudioCapture:
         if self._thread:
             try:
                 self._thread.join(timeout=3)
-            except (KeyboardInterrupt, SystemExit):
+            except KeyboardInterrupt, SystemExit:
                 pass
 
     def set_device(self, device_index: int) -> None:

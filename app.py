@@ -40,6 +40,8 @@ from textual.widgets import (
     Select,
     Static,
 )
+from textual.widgets._select import SelectOverlay  # type: ignore[attr-defined]
+from textual.widgets.option_list import Option  # type: ignore[attr-defined]
 from textual import work
 
 from audio import AudioCapture, list_input_devices, default_device
@@ -209,6 +211,47 @@ WHISPER_MODELS: list[tuple[str, str]] = [
     ("large", "Large  (~1.5B)"),
 ]
 
+# ---------------------------------------------------------------------------
+# Grouped audio device selector
+# ---------------------------------------------------------------------------
+
+# Negative sentinel values used as the "value" of group-header pseudo-options.
+# They must not collide with any real sounddevice index (always >= 0).
+_GRP_APP: int = -1
+_GRP_MONITOR: int = -2
+_GRP_INPUT: int = -3
+
+_GROUP_ORDER: list[str] = ["app", "monitor", "sound"]
+_GROUP_LABELS: dict[str, str] = {
+    "app": "── Applications ──",
+    "monitor": "── Monitors ──",
+    "sound": "── Hardware Inputs ──",
+}
+
+
+class GroupedSelect(Select[int]):
+    """A Select[int] subclass that renders sentinel-valued options as disabled
+    group-header rows.  All options with a negative value are treated as headers
+    (shown dimmed and not selectable); non-negative values behave normally.
+    """
+
+    def _setup_options_renderables(self) -> None:  # type: ignore[override]
+        """Override to turn negative-value options into disabled headers."""
+        from rich.text import Text as RichText
+
+        options: list[Option] = []
+        for prompt, value in self._options:  # type: ignore[attr-defined]
+            if value == self.NULL:
+                options.append(Option(RichText(self.prompt, style="dim")))
+            elif isinstance(value, int) and value < 0:
+                options.append(Option(prompt, disabled=True))
+            else:
+                options.append(Option(prompt))
+
+        option_list = self.query_one(SelectOverlay)
+        option_list.clear_options()
+        option_list.add_options(options)
+
 
 # ---------------------------------------------------------------------------
 # CSS
@@ -262,7 +305,7 @@ RichLog {
 }
 
 #source-select {
-    width: 30;
+    width: 38;
 }
 
 #lang-select {
@@ -455,7 +498,7 @@ class PolyglotApp(App):
         with Vertical(id="controls"):
             with Horizontal(id="controls-row"):
                 yield Label("Audio:", classes="control-label")
-                yield Select(
+                yield GroupedSelect(
                     options=self._device_options(),
                     value=self._current_device_index,
                     id="source-select",
@@ -820,6 +863,9 @@ class PolyglotApp(App):
             if event.value is Select.BLANK:
                 return
             new_idx = int(str(event.value))
+            # Ignore clicks on group-header sentinel options
+            if new_idx < 0:
+                return
             self._current_device_index = new_idx
             if self._capture:
                 self._capture.set_device(new_idx)
@@ -904,7 +950,29 @@ class PolyglotApp(App):
     # ------------------------------------------------------------------
 
     def _device_options(self) -> list[tuple[str, int]]:
-        return [(d["name"], d["index"]) for d in self._devices]
+        """Build grouped (prompt, value) pairs for GroupedSelect.
+
+        Group headers have negative sentinel values and will be rendered as
+        disabled (non-selectable) rows.  Device entries use their sounddevice
+        index as the value.
+        """
+        # Bucket devices by group
+        buckets: dict[str, list[dict]] = {"app": [], "monitor": [], "sound": []}
+        for d in self._devices:
+            g = d.get("group", "sound")
+            if g in buckets:
+                buckets[g].append(d)
+
+        sentinels = {"app": _GRP_APP, "monitor": _GRP_MONITOR, "sound": _GRP_INPUT}
+        options: list[tuple[str, int]] = []
+        for group in _GROUP_ORDER:
+            devs = buckets[group]
+            if not devs:
+                continue
+            options.append((_GROUP_LABELS[group], sentinels[group]))
+            for d in devs:
+                options.append((d["name"], d["index"]))
+        return options
 
     def _device_name(self, index: int) -> str:
         for d in self._devices:
