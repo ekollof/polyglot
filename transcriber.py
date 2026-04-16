@@ -1024,35 +1024,25 @@ class Transcriber:
             except Exception as exc:
                 logger.warning("Inline detect failed: %s", exc)
 
-        # Only force the language if detection was confident enough.
-        # Whisper with a wrong forced language (and matching initial_prompt)
-        # translates instead of transcribing.  With lang=None, Whisper
-        # auto-detects on the full 5-7s commit audio — far more reliable than
-        # the 1s detection snippet used by _infer_detect.
-        _COMMIT_LANG_MIN_CONFIDENCE = 0.70
-        commit_lang: Optional[str] = (
-            lang
-            if lang is not None
-            and self._detected_confidence is not None
-            and self._detected_confidence >= _COMMIT_LANG_MIN_CONFIDENCE
-            else None
-        )
-        if commit_lang is None and lang is not None:
-            logger.debug(
-                "Commit: confidence %.2f < %.2f for lang=%s — using Whisper auto-detect.",
-                self._detected_confidence or 0.0,
-                _COMMIT_LANG_MIN_CONFIDENCE,
-                lang,
-            )
+        # Never force the language on commits.  With task="transcribe" and
+        # language=None, Whisper auto-detects the language per commit window
+        # and transcribes in that language — it does NOT translate.  Forcing
+        # language="en" on audio that contains Arabic/Farsi words causes
+        # Whisper to either translate semantically (fluent English output that
+        # is actually a translation) or produce low-logprob phonetic garbage
+        # that our filter then drops.  Both outcomes are worse than letting
+        # Whisper pick the language itself from the actual audio.
+        commit_lang: Optional[str] = None
+        logger.debug("Commit: using Whisper auto-detect (lang hint=%s)", lang)
 
-        # Only use initial_prompt when it was generated for the same language
-        # as this commit.  A mismatched prompt (e.g. English prompt on Farsi
-        # audio) biases the decoder toward the prompt language and causes
-        # Whisper to translate instead of transcribe.
+        # Only use initial_prompt when it matches the hinted language — a
+        # mismatched English prompt on Farsi audio biases the decoder toward
+        # English and can cause translation.  Since commit_lang is always None
+        # now we only pass the prompt when the hint agrees with it.
         use_initial_prompt = (
             bool(self._initial_prompt)
-            and commit_lang is not None
-            and self._initial_prompt_lang == commit_lang
+            and lang is not None
+            and self._initial_prompt_lang == lang
         )
 
         logger.debug(
