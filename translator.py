@@ -151,6 +151,12 @@ class Translator:
         logger.info("Translation engine changed to '%s'.", engine)
         self._on_status(f"Translation engine: {engine}")
 
+    def set_ollama_model(self, model: str) -> None:
+        """Switch the Ollama model used for translation.  Thread-safe."""
+        with self._lock:
+            self._ollama_model = model
+        logger.info("Ollama model changed to '%s'.", model)
+
     @property
     def engine(self) -> str:
         with self._lock:
