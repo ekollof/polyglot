@@ -1197,6 +1197,45 @@ class Transcriber:
                     self.on_non_speech("no_speech")
                 return
 
+            # ── Lang-mismatch gate ───────────────────────────────────────────
+            # If Whisper returns a language that differs from our high-confidence
+            # cached language, and the audio is short or very quiet, be
+            # suspicious: this is most likely a wrong-language hallucination on
+            # silence or tail noise.  Ask Lingua to arbitrate.  If Lingua agrees
+            # with the cached language (or can't confirm Whisper's claim), reject
+            # the commit as non-speech so the cache is not poisoned.
+            _utterance_secs = len(audio) / WHISPER_RATE
+            _audio_rms = float(audio.std()) if len(audio) else 0.0
+            if (
+                self._detected_lang is not None
+                and detected_lang != self._detected_lang
+                and self._detected_confidence is not None
+                and self._detected_confidence >= 0.80
+                and (_utterance_secs < 3.0 or _audio_rms < 0.03)
+            ):
+                lingua_check = _lingua_detect(source_text) if source_text else None
+                if lingua_check is None or lingua_check == self._detected_lang:
+                    logger.debug(
+                        "Commit lang mismatch rejected — Whisper=%s but cached=%s "
+                        "(%.1fs, rms=%.4f, Lingua=%s): %r",
+                        detected_lang,
+                        self._detected_lang,
+                        _utterance_secs,
+                        _audio_rms,
+                        lingua_check,
+                        source_text[:40],
+                    )
+                    if self.on_non_speech:
+                        self.on_non_speech("no_speech")
+                    return
+                # Lingua agrees with Whisper — genuine language switch.
+                logger.debug(
+                    "Commit lang switch confirmed by Lingua: %s → %s: %r",
+                    self._detected_lang,
+                    detected_lang,
+                    source_text[:40],
+                )
+
             # Update cached language with what Whisper confirmed.
             self._detected_lang = detected_lang
             self._vad_lang = detected_lang
