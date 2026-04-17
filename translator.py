@@ -355,16 +355,19 @@ class Translator:
             # Language display names for a more natural prompt.
             from_name = _LANG_NAMES.get(from_lang, from_lang)
             to_name = _LANG_NAMES.get(to_lang, to_lang)
-            prompt = (
-                f"Translate the following {from_name} text to {to_name}. "
-                f"Output ONLY the translation with no explanation, no quotes, "
-                f"no prefix, no extra words.\n\n"
-                f"Text: {text}\n\nTranslation:"
+            system = (
+                "You are a silent translation engine. "
+                "When given text, you output ONLY the translated text — "
+                "no explanations, no notes, no prefixes, no quotes, no labels. "
+                "Never say 'Here is the translation' or anything similar. "
+                "If the input is already in the target language, output it unchanged."
             )
+            prompt = f"Translate the following {from_name} text to {to_name}.\n\n{text}"
             resp = requests.post(
                 f"{self._ollama_url}/api/generate",
                 json={
                     "model": self._ollama_model,
+                    "system": system,
                     "prompt": prompt,
                     "stream": False,
                 },
