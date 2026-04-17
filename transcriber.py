@@ -44,6 +44,7 @@ Loaded from the cached torch.hub snapshot
 from __future__ import annotations
 
 import logging
+import collections
 import queue
 import sys
 import threading
@@ -87,6 +88,20 @@ DETECT_SECONDS = 3.0
 # is discarded.  This ensures that a long pause between speakers (e.g. video
 # cut, topic change) doesn't carry a stale language into the next utterance.
 SILENCE_LANG_RESET_S = 3.0
+
+# ---------------------------------------------------------------------------
+# Speech buffer for language detection
+# ---------------------------------------------------------------------------
+# After each commit that produces real speech, the audio is appended to a
+# rolling deque.  Language detection runs on the concatenated buffer rather
+# than on the raw 3-second VAD window, giving the detector 5–30 seconds of
+# confirmed-speech audio instead of potentially noisy silence snapshots.
+#
+# This eliminates the main source of false language switches: a single short,
+# quiet utterance at the tail of a sentence being mis-labelled by Whisper and
+# poisoning _detected_lang for subsequent commits.
+LANG_BUFFER_MIN_SECS: float = 5.0  # minimum speech before buffer-based detection
+LANG_BUFFER_MAX_SECS: float = 30.0  # oldest audio evicted beyond this
 
 # ---------------------------------------------------------------------------
 # VAD tuning
@@ -419,6 +434,14 @@ class Transcriber:
         self._sb_lang: Optional[str] = None  # LangID thread → inference thread
         self._sb_confidence: Optional[float] = None  # LangID thread → inference thread
 
+        # Rolling speech buffer for language detection.
+        # Each entry is a numpy audio chunk from a confirmed-speech commit.
+        # Language detection runs on the concatenation of all chunks when the
+        # buffer contains at least LANG_BUFFER_MIN_SECS of audio.
+        # Only touched by the inference thread — no lock needed.
+        self._speech_buffer: collections.deque = collections.deque()
+        self._speech_buffer_secs: float = 0.0
+
         # Last committed text, fed back as Whisper's initial_prompt to keep
         # context consistent across rolling-commit window boundaries.
         # Capped at ~200 chars (~224 tokens).  Inference thread only.
@@ -623,6 +646,10 @@ class Transcriber:
                     self._last_partial_text = ""
                     self._stuck_partial_count = 0
                     self._commit_requested.clear()
+                    # Clear speech buffer so the next speaker starts fresh
+                    # without the previous speaker's audio biasing detection.
+                    self._speech_buffer.clear()
+                    self._speech_buffer_secs = 0.0
 
                 case "partial":
                     _, audio, lang = item
@@ -678,6 +705,38 @@ class Transcriber:
 
     # ------------------------------------------------------------------
 
+    def _push_speech_buffer(self, audio: np.ndarray) -> None:
+        """Append confirmed-speech audio to the rolling language-detection buffer.
+
+        Called by _infer_commit after at least one segment is emitted.
+        Evicts the oldest chunks when the buffer exceeds LANG_BUFFER_MAX_SECS.
+        Inference thread only — no locking required.
+        """
+        secs = len(audio) / WHISPER_RATE
+        self._speech_buffer.append(audio)
+        self._speech_buffer_secs += secs
+        while self._speech_buffer_secs > LANG_BUFFER_MAX_SECS and self._speech_buffer:
+            oldest = self._speech_buffer.popleft()
+            self._speech_buffer_secs -= len(oldest) / WHISPER_RATE
+
+    def _buffer_audio_for_detect(self, fallback: np.ndarray) -> np.ndarray:
+        """Return audio to use for language detection.
+
+        If the speech buffer has at least LANG_BUFFER_MIN_SECS of confirmed
+        speech, concatenate and return it (trimmed to LANG_BUFFER_MAX_SECS).
+        Otherwise return the raw VAD snapshot passed as fallback.
+        """
+        if self._speech_buffer_secs >= LANG_BUFFER_MIN_SECS:
+            combined = np.concatenate(list(self._speech_buffer))
+            max_samples = int(LANG_BUFFER_MAX_SECS * WHISPER_RATE)
+            if len(combined) > max_samples:
+                combined = combined[-max_samples:]
+            logger.debug(
+                "Lang detect on speech buffer (%.1fs)", self._speech_buffer_secs
+            )
+            return combined
+        return fallback
+
     def _infer_detect(self, model, audio: np.ndarray) -> None:
         """Run detect_language and update _detected_lang / _vad_lang.
 
@@ -699,6 +758,11 @@ class Transcriber:
         < 0.65   — reject outright; keep current language.
         """
         import time as _time
+
+        # Use the rolling speech buffer when it has enough confirmed speech.
+        # This replaces the raw 3-second VAD snapshot with 5–30 seconds of
+        # actual spoken audio, making detection far more reliable.
+        audio = self._buffer_audio_for_detect(audio)
 
         # Staleness check: if _detected_lang hasn't been confirmed by a
         # confident detection within LANG_STALE_SECONDS, clear it so the next
@@ -1197,51 +1261,10 @@ class Transcriber:
                     self.on_non_speech("no_speech")
                 return
 
-            # ── Lang-mismatch gate ───────────────────────────────────────────
-            # If Whisper returns a language that differs from our high-confidence
-            # cached language, and the audio is short or very quiet, be
-            # suspicious: this is most likely a wrong-language hallucination on
-            # silence or tail noise.  Ask Lingua to arbitrate.  If Lingua agrees
-            # with the cached language (or can't confirm Whisper's claim), reject
-            # the commit as non-speech so the cache is not poisoned.
-            _utterance_secs = len(audio) / WHISPER_RATE
-            _audio_rms = float(audio.std()) if len(audio) else 0.0
-            if (
-                self._detected_lang is not None
-                and detected_lang != self._detected_lang
-                and self._detected_confidence is not None
-                and self._detected_confidence >= 0.80
-                and (_utterance_secs < 3.0 or _audio_rms < 0.03)
-            ):
-                lingua_check = _lingua_detect(source_text) if source_text else None
-                if lingua_check is None or lingua_check == self._detected_lang:
-                    logger.debug(
-                        "Commit lang mismatch rejected — Whisper=%s but cached=%s "
-                        "(%.1fs, rms=%.4f, Lingua=%s): %r",
-                        detected_lang,
-                        self._detected_lang,
-                        _utterance_secs,
-                        _audio_rms,
-                        lingua_check,
-                        source_text[:40],
-                    )
-                    if self.on_non_speech:
-                        self.on_non_speech("no_speech")
-                    return
-                # Lingua agrees with Whisper — genuine language switch.
-                logger.debug(
-                    "Commit lang switch confirmed by Lingua: %s → %s: %r",
-                    self._detected_lang,
-                    detected_lang,
-                    source_text[:40],
-                )
-
-            # Update cached language with what Whisper confirmed.
-            self._detected_lang = detected_lang
-            self._vad_lang = detected_lang
-            # Refresh staleness timer so a language confirmed by every commit
-            # doesn't expire just because the LangID thread hasn't fired lately.
-            self._detected_lang_set_at = time.monotonic()
+            # _detected_lang is now managed exclusively by _infer_detect, which
+            # runs on the rolling speech buffer.  Commits no longer update the
+            # cache — doing so was the root cause of language flips from short,
+            # quiet tail utterances being mis-labelled by Whisper.
 
             elapsed = time.monotonic() - t0
             logger.debug(
@@ -1365,6 +1388,8 @@ class Transcriber:
                 # All segments were filtered — classify as non-speech.
                 self.on_non_speech("no_speech")
             elif any_emitted:
+                # Push confirmed speech into the rolling language-detection buffer.
+                self._push_speech_buffer(audio)
                 self._last_partial_text = ""
                 self._stuck_partial_count = 0
 
