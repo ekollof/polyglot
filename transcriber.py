@@ -1300,11 +1300,12 @@ class Transcriber:
                             self.on_speaker_change()
                     self._last_speaker_embed = current_embed
 
-            # Emit each segment as a separate result so the UI shows one
-            # sentence per row instead of a wall of text.  Fall back to the
-            # full text as a single result if there are no segments (shouldn't
-            # happen with Whisper, but be defensive).
+            # Collect all passing segments and join them into a single emission
+            # per commit.  Emitting each Whisper segment as its own row caused
+            # sentence fragmentation (e.g. "carpet. So" / "means carpet." as
+            # two separate rows).  Joining preserves natural sentence flow.
             any_emitted = False
+            kept_texts: list[str] = []
             if segments:
                 for seg in segments:
                     seg_text = str(seg.get("text", "")).strip()
@@ -1366,12 +1367,21 @@ class Transcriber:
                         )
                         continue
                     logger.debug(
-                        "  segment emitted — avg_logprob=%.3f no_speech_prob=%.3f text=%r",
+                        "  segment kept — avg_logprob=%.3f no_speech_prob=%.3f text=%r",
                         seg.get("avg_logprob", 0.0),
                         seg.get("no_speech_prob", 0.0),
                         seg_text[:60],
                     )
-                    self.on_result(detected_lang, seg_text, self._detected_confidence)
+                    kept_texts.append(seg_text)
+
+                if kept_texts:
+                    joined = " ".join(kept_texts)
+                    logger.debug(
+                        "  segment emitted (joined %d segs) text=%r",
+                        len(kept_texts),
+                        joined[:80],
+                    )
+                    self.on_result(detected_lang, joined, self._detected_confidence)
                     any_emitted = True
             else:
                 if not _is_repetition_loop(source_text):
