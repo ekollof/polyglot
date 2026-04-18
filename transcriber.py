@@ -282,6 +282,80 @@ def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
 # case where Whisper correctly transcribes the script but mislabels it.
 # Thread-safe: Lingua documentation explicitly guarantees this.
 
+# Common abbreviations that end with a period but are NOT sentence boundaries.
+# Whisper usually capitalises after them anyway, so this list only needs to
+# cover the most frequent false-positive triggers.
+_ABBREVS = frozenset(
+    [
+        "mr",
+        "mrs",
+        "ms",
+        "dr",
+        "prof",
+        "sr",
+        "jr",
+        "vs",
+        "etc",
+        "inc",
+        "corp",
+        "ltd",
+        "est",
+        "dept",
+        "approx",
+        "fig",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "oct",
+        "nov",
+        "dec",
+        "st",
+        "ave",
+        "blvd",
+        "u.s",
+        "u.k",
+        "e.g",
+        "i.e",
+    ]
+)
+
+# Sentence-ending punctuation followed by whitespace then an uppercase letter
+# (or a digit, to catch "2. Next item" style lists).
+_SENT_SPLIT_RE = _re.compile(
+    r"(?<=[.?!])\s+(?=[A-Z\d\u0600-\u06FF\u0400-\u04FF\u4E00-\u9FFF])"
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split *text* into sentences on terminal punctuation boundaries.
+
+    Uses a regex split on [.?!] followed by whitespace + uppercase/non-Latin
+    start, with a post-filter that re-joins splits caused by known abbreviations
+    (e.g. "Mr. Smith" must not become two sentences).
+    """
+    parts = _SENT_SPLIT_RE.split(text)
+    merged: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if merged:
+            # Check if the previous part ended with an abbreviation period.
+            prev = merged[-1]
+            # Strip trailing punctuation to get the last word.
+            last_word = _re.split(r"\s+", prev)[-1].rstrip(".").lower()
+            if last_word in _ABBREVS:
+                merged[-1] = prev + " " + part
+                continue
+        merged.append(part)
+    return merged if merged else [text]
+
+
 _lingua_detector = None  # lazily initialised on first call
 
 
@@ -1376,12 +1450,15 @@ class Transcriber:
 
                 if kept_texts:
                     joined = " ".join(kept_texts)
+                    sentences = _split_sentences(joined)
                     logger.debug(
-                        "  segment emitted (joined %d segs) text=%r",
+                        "  emitting %d sentence(s) from %d segment(s): %r",
+                        len(sentences),
                         len(kept_texts),
                         joined[:80],
                     )
-                    self.on_result(detected_lang, joined, self._detected_confidence)
+                    for sent in sentences:
+                        self.on_result(detected_lang, sent, self._detected_confidence)
                     any_emitted = True
             else:
                 if not _is_repetition_loop(source_text):
