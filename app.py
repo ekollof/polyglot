@@ -769,8 +769,11 @@ class PolyglotApp(App):
         self, row_id: int, source_text: str, detected_lang: str
     ) -> None:
         """Replace the partial line with the final transcription in normal style."""
-        source_log = self.query_one("#source-log", RichLog)
-        trans_log = self.query_one("#translation-log", RichLog)
+        try:
+            source_log = self.query_one("#source-log", RichLog)
+            trans_log = self.query_one("#translation-log", RichLog)
+        except Exception:
+            return  # widgets already torn down on quit
 
         if self._pending_row_id == row_id:
             self._pop_partial(source_log, self._source_strip_start)

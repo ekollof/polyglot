@@ -1486,7 +1486,10 @@ class Transcriber:
             self._detected_lang = None
             self._detected_confidence = None
             self._vad_lang = None
-            self.on_result("?", "", None)
+            try:
+                self.on_result("?", "", None)
+            except Exception:
+                pass  # app may already be shut down
 
     # ------------------------------------------------------------------
     # VAD thread  (never touches Whisper)
