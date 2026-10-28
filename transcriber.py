@@ -7,7 +7,7 @@ Audio chunks (float32 mono 16kHz) arrive from the queue continuously.
 Each chunk is fed to a Silero-VAD iterator that detects speech/silence
 boundaries in real time (~32ms latency per chunk).
 
-There are exactly TWO threads:
+There are three processing threads:
 
   1. VAD thread  (_run):
        Reads audio chunks, runs Silero-VAD, tracks utterance state, and
@@ -19,11 +19,16 @@ There are exactly TWO threads:
        are NO locks — _detected_lang is a plain attribute written and read
        exclusively by this thread.
 
+  3. LangID thread (_run_langid):
+       Classifies timestamped audio with SpeechBrain and publishes immutable
+       evidence snapshots. It never calls Whisper or changes detected language.
+
 Work items posted onto _infer_queue
 ------------------------------------
-  ("detect",  audio_np)          — run detect_language, update _detected_lang
-  ("partial", audio_np, lang)    — run transcribe (greedy), fire on_partial
-  ("commit",  audio_np, lang)    — drain stale partials, run transcribe, fire on_result
+  ("detect", audio_np, captured_at) — detect language on recent confirmed speech
+  ("partial", audio_np, lang) — run greedy transcription, fire on_partial
+  ("commit", audio_np, lang, captured_at, boundary) — decode then signal a pause
+  ("reset_lang", captured_at) — clear old speech and language context
 
 The queue is a standard queue.Queue which is thread-safe by itself.
 No additional locking is needed.
@@ -31,29 +36,37 @@ No additional locking is needed.
 VAD parameters
 --------------
 - threshold: 0.3
-- min_silence_duration_ms: adaptive (300/400/600 ms based on speaker pace)
+- min_silence_duration_ms: 600 ms
 - speech_pad_ms: 100 ms
 - max_utterance_seconds: 25 s
 
 Silero-VAD
 ----------
-Loaded from the cached torch.hub snapshot
-(~/.cache/torch/hub/snakers4_silero-vad_master).  torchaudio is NOT required.
+Loaded from the installed silero-vad package.
 """
 
 from __future__ import annotations
 
-import logging
 import collections
+import logging
 import queue
-import sys
 import threading
 import time
-import types
 from typing import Callable, Optional
 
 import numpy as np
 import torch
+
+from sentence_buffer import completed_sentences
+from speech_quality import (
+    MIN_ROLLING_PAUSE_SECONDS,
+    LanguageEvidence,
+    closest_language_evidence,
+    coalesce_inference_work,
+    fuse_language_probabilities,
+    rolling_audio_boundary,
+    segment_confidence_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,25 +77,18 @@ MAX_UTTERANCE_SECONDS = 25  # absolute safety cap
 # inference stays fast even during very long utterances.
 MAX_PARTIAL_SECONDS = 8
 
-# For continuous speech with no VAD silence (fast speakers, monologues),
-# force-commit after this many seconds so each commit contains 1–3 sentences
-# rather than a wall of text.  The buffer is reset and VAD state continues
-# so the next commit picks up seamlessly.
-ROLLING_COMMIT_S = 7.0
+# Initial continuous-speech window. Scheduling adapts it up to eight seconds
+# on slow hardware; fast models can commit without waiting seven seconds.
+ROLLING_COMMIT_S = 4.0
 
 # How often to fire interim (partial) results while speech is ongoing.
 # turbo runs at ~3× real-time on ROCm, so 1.0 s gives it enough headroom
 # to finish a partial pass before the next one is triggered.
 INTERIM_INTERVAL_S = 1.0
 
-# How many seconds of audio to feed to detect_language().
-# 3.0 s gives Whisper enough audio to overcome zero-padding dominance in the
-# 30 s mel spectrogram window. With only 1 s of speech + 29 s of zeros the
-# silence bins swamp the signal and Whisper reliably misdetects short Farsi
-# (and other non-Latin-script) clips as English. At 3 s the real phonemes
-# dominate and detection accuracy is much higher (fa p=0.98 observed vs
-# en p=0.83 at 1 s).
-DETECT_SECONDS = 3.0
+# Wait for five seconds of speech before the first VAD language snapshot;
+# very short fragments do not provide reliable multilingual context.
+DETECT_SECONDS = 5.0
 
 # How many seconds of continuous silence before the cached detected language
 # is discarded.  This ensures that a long pause between speakers (e.g. video
@@ -94,13 +100,14 @@ SILENCE_LANG_RESET_S = 3.0
 # ---------------------------------------------------------------------------
 # After each commit that produces real speech, the audio is appended to a
 # rolling deque.  Language detection runs on the concatenated buffer rather
-# than on the raw 3-second VAD window, giving the detector 5–30 seconds of
+# than on raw VAD snapshots, giving the detector 5–12 seconds of
 # confirmed-speech audio instead of potentially noisy silence snapshots.
 #
 # This eliminates the main source of false language switches: a single short,
 # quiet utterance at the tail of a sentence being mis-labelled by Whisper and
 # poisoning _detected_lang for subsequent commits.
 LANG_BUFFER_MIN_SECS: float = 5.0  # minimum speech before buffer-based detection
+LANG_DETECT_WINDOW_SECS: float = 12.0
 LANG_BUFFER_MAX_SECS: float = 30.0  # oldest audio evicted beyond this
 
 # ---------------------------------------------------------------------------
@@ -153,19 +160,6 @@ NonSpeechCallback = Callable[[str], None]
 # slightly higher false-positive rate.
 SPEAKER_CHANGE_THRESHOLD: float = 0.75
 
-# ---------------------------------------------------------------------------
-# Language ID fusion weights
-# ---------------------------------------------------------------------------
-# SpeechBrain VoxLingua107 runs in its own dedicated thread (LangID) and
-# produces audio-domain language probabilities independently of Whisper.
-# When both detectors agree, confidence is a weighted average biased toward
-# SpeechBrain (purpose-built audio LID, 6.7% WER on 107 languages).
-# When they disagree, the higher-confidence detector wins but is discounted.
-LANGID_WEIGHT_SB: float = 0.60  # SpeechBrain share when detectors agree
-LANGID_WEIGHT_WH: float = 0.40  # Whisper share when detectors agree
-LANGID_DISAGREE_DISCOUNT: float = 0.80  # multiply winner confidence on disagree
-
-
 # Segments whose text is entirely Whisper noise/music tokens should be
 # suppressed.  The regex matches the *whole* stripped text.
 import re as _re
@@ -183,22 +177,6 @@ _NOISE_TOKEN_RE = _re.compile(
     r"[\s♪♫♬♩.!,]*$",  # trailing punctuation
     _re.IGNORECASE,
 )
-
-# Segments whose avg_logprob is below this are likely music/noise
-# hallucinations.  Whisper's own threshold is -1.0; music hallucinations
-# typically cluster in [-0.65, -1.0] while real speech sits above -0.6.
-# Log every skipped segment so the threshold can be tuned from polyglot.log.
-# Set to -0.8 (was -0.65) so that foreign words embedded in an otherwise-English
-# utterance are not dropped: forced language="en" makes those segments score
-# poorly even when they contain real speech.
-AVG_LOGPROB_THRESHOLD: float = -0.95
-# Segments that fall below AVG_LOGPROB_THRESHOLD but whose text is confidently
-# identified by Lingua as a *different* language than Whisper's detected_lang
-# are rescued up to this looser threshold.  The rationale: when Whisper runs
-# in the wrong language (e.g. en hint on fa audio), logprob is artificially
-# low because the decoder is fighting against the wrong phoneme distribution.
-# Lingua agrees the text is real language but just a different one.
-AVG_LOGPROB_RESCUE_THRESHOLD: float = -1.5
 
 # Seconds since the last confident language confirmation before we treat
 # _detected_lang as stale and clear it.  Prevents a wrong language from
@@ -282,78 +260,11 @@ def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
 # case where Whisper correctly transcribes the script but mislabels it.
 # Thread-safe: Lingua documentation explicitly guarantees this.
 
-# Common abbreviations that end with a period but are NOT sentence boundaries.
-# Whisper usually capitalises after them anyway, so this list only needs to
-# cover the most frequent false-positive triggers.
-_ABBREVS = frozenset(
-    [
-        "mr",
-        "mrs",
-        "ms",
-        "dr",
-        "prof",
-        "sr",
-        "jr",
-        "vs",
-        "etc",
-        "inc",
-        "corp",
-        "ltd",
-        "est",
-        "dept",
-        "approx",
-        "fig",
-        "jan",
-        "feb",
-        "mar",
-        "apr",
-        "jun",
-        "jul",
-        "aug",
-        "sep",
-        "oct",
-        "nov",
-        "dec",
-        "st",
-        "ave",
-        "blvd",
-        "u.s",
-        "u.k",
-        "e.g",
-        "i.e",
-    ]
-)
-
-# Sentence-ending punctuation followed by whitespace then an uppercase letter
-# (or a digit, to catch "2. Next item" style lists).
-_SENT_SPLIT_RE = _re.compile(
-    r"(?<=[.?!])\s+(?=[A-Z\d\u0600-\u06FF\u0400-\u04FF\u4E00-\u9FFF])"
-)
-
 
 def _split_sentences(text: str) -> list[str]:
-    """Split *text* into sentences on terminal punctuation boundaries.
-
-    Uses a regex split on [.?!] followed by whitespace + uppercase/non-Latin
-    start, with a post-filter that re-joins splits caused by known abbreviations
-    (e.g. "Mr. Smith" must not become two sentences).
-    """
-    parts = _SENT_SPLIT_RE.split(text)
-    merged: list[str] = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if merged:
-            # Check if the previous part ended with an abbreviation period.
-            prev = merged[-1]
-            # Strip trailing punctuation to get the last word.
-            last_word = _re.split(r"\s+", prev)[-1].rstrip(".").lower()
-            if last_word in _ABBREVS:
-                merged[-1] = prev + " " + part
-                continue
-        merged.append(part)
-    return merged if merged else [text]
+    """Emit completed sentences plus an unfinished tail for UI assembly."""
+    complete, pending = completed_sentences(text)
+    return complete + ([pending] if pending else [])
 
 
 _lingua_detector = None  # lazily initialised on first call
@@ -364,9 +275,11 @@ def _lingua_detect(text: str) -> Optional[str]:
 
     Uses Lingua's full-language detector (75 languages).  The detector is
     built lazily on first call and cached for the life of the process.
-    Only returns a result when Lingua's top confidence value exceeds 0.70,
-    i.e. the library is reasonably sure.
+    Requires twelve letters, a top confidence of at least 0.80, and a
+    0.20 margin over the runner-up; audio evidence must corroborate overrides.
     """
+    if sum(character.isalpha() for character in text) < 12:
+        return None
     global _lingua_detector
     try:
         if _lingua_detector is None:
@@ -381,7 +294,7 @@ def _lingua_detect(text: str) -> Optional[str]:
         if not values:
             return None
         top = values[0]  # sorted descending by confidence
-        if top.value < 0.70:
+        if top.value < 0.80 or (len(values) > 1 and top.value - values[1].value < 0.20):
             return None
         # iso_code_639_1 is an enum; .name is e.g. "EN", "FA", "FR", "JA"
         return top.language.iso_code_639_1.name.lower()
@@ -391,23 +304,12 @@ def _lingua_detect(text: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Silero-VAD loader (no torchaudio required)
+# Silero-VAD loader
 # ---------------------------------------------------------------------------
-
-_SILERO_SRC = "/home/andrath/.cache/torch/hub/snakers4_silero-vad_master/src"
 
 
 def _load_silero_vad():
-    """Load Silero-VAD model and VADIterator without requiring torchaudio."""
-    if "torchaudio" not in sys.modules:
-        stub = types.ModuleType("torchaudio")
-        stub.__spec__ = type(sys)("torchaudio")  # type: ignore[arg-type]
-        setattr(stub, "__version__", "0.0.0")
-        sys.modules["torchaudio"] = stub
-
-    if _SILERO_SRC not in sys.path:
-        sys.path.insert(0, _SILERO_SRC)
-
+    """Load the packaged Silero-VAD model and VADIterator."""
     from silero_vad import VADIterator, load_silero_vad  # type: ignore
 
     model = load_silero_vad(onnx=False)
@@ -448,7 +350,7 @@ class Transcriber:
     model_name:
         Whisper model identifier (e.g. "turbo", "small", "medium").
     device:
-        PyTorch device string ("cuda", "cpu").
+        PyTorch device string, or None to select a validated accelerator.
     """
 
     def __init__(
@@ -459,7 +361,7 @@ class Transcriber:
         on_speaker_change: Optional[SpeakerChangeCallback] = None,
         on_non_speech: Optional[NonSpeechCallback] = None,
         model_name: str = "turbo",
-        device: str = "cuda",
+        device: Optional[str] = None,
     ):
         self.audio_queue = audio_queue
         self.on_result = on_result
@@ -467,7 +369,20 @@ class Transcriber:
         self.on_speaker_change = on_speaker_change
         self.on_non_speech = on_non_speech
         self.model_name = model_name
-        self.device = device
+        self._requested_device = device
+        self._backend_name = "Detecting accelerator…"
+        self._fp16 = False
+        self._rolling_commit_seconds = ROLLING_COMMIT_S
+        self._partials_enabled = True
+        self._quality_retry_allowed = True
+        self._last_language_inference_at = 0.0
+        self._last_transcribed_lang = None
+        self.device = (
+            device
+            if device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self._langid_device = self.device if self.device.startswith("cuda") else "cpu"
 
         self._stop_event = threading.Event()
         self._vad_thread: Optional[threading.Thread] = None
@@ -507,6 +422,11 @@ class Transcriber:
         # inference thread.  Plain attribute writes are GIL-atomic in CPython.
         self._sb_lang: Optional[str] = None  # LangID thread → inference thread
         self._sb_confidence: Optional[float] = None  # LangID thread → inference thread
+        self._sb_history: tuple[LanguageEvidence, ...] = ()
+        self._language_reset_at = 0.0
+        self._language_candidate: Optional[str] = None
+        self._language_candidate_hits = 0
+        self._last_detect_evidence = None
 
         # Rolling speech buffer for language detection.
         # Each entry is a numpy audio chunk from a confirmed-speech commit.
@@ -515,6 +435,8 @@ class Transcriber:
         # Only touched by the inference thread — no lock needed.
         self._speech_buffer: collections.deque = collections.deque()
         self._speech_buffer_secs: float = 0.0
+        self._speech_buffer_revision = 0
+        self._speech_buffer_at = 0.0
 
         # Last committed text, fed back as Whisper's initial_prompt to keep
         # context consistent across rolling-commit window boundaries.
@@ -580,25 +502,22 @@ class Transcriber:
     # Model loading
     # ------------------------------------------------------------------
 
+    @property
+    def backend_name(self) -> str:
+        from inference_backend import backend_name
+
+        return backend_name(self._whisper_model, self._backend_name)
+
     def _load_models(self):
-        logger.info("Loading Whisper model '%s' on %s…", self.model_name, self.device)
-        import whisper
-        from whisper.model import MultiHeadAttention
+        from inference_backend import load_whisper
 
-        whisper_model = whisper.load_model(self.model_name, device=self.device)
-
-        # ROCm's scaled_dot_product_attention kernel crashes with a shape
-        # mismatch when Whisper's kv_cache hooks are active.  Disabling SDPA
-        # forces the manual matmul path, which works correctly and is fast
-        # enough (turbo: ~3× real-time).  The additional qkv_attention monkey-
-        # patch is NOT applied — it was written to fix a mask-slicing bug in
-        # the manual path, but benchmarking shows it makes turbo 10× slower
-        # and causes empty decoder output; use_sdpa=False alone is sufficient.
-        MultiHeadAttention.use_sdpa = False
-        logger.info("SDPA disabled — using manual attention (ROCm workaround).")
-
-        logger.info("Whisper model loaded.")
-        return whisper_model
+        model, self._backend_name = load_whisper(
+            self.model_name, device=self._requested_device
+        )
+        self.device = str(model.device)
+        self._fp16 = model.inference_fp16
+        logger.info("Whisper model loaded — %s", self._backend_name)
+        return model
 
     # ------------------------------------------------------------------
     # LangID thread  (SpeechBrain VoxLingua107, runs in parallel to Whisper)
@@ -633,7 +552,7 @@ class Transcriber:
             language_id = EncoderClassifier.from_hparams(
                 source="speechbrain/lang-id-voxlingua107-ecapa",
                 savedir=_savedir,
-                run_opts={"device": self.device},
+                run_opts={"device": self._langid_device},
             )
             logger.info("LangID — SpeechBrain VoxLingua107 loaded.")
         except Exception as exc:
@@ -653,7 +572,7 @@ class Transcriber:
             if item is None:  # stop sentinel
                 break
 
-            audio: np.ndarray = item
+            captured_at, audio = item
             try:
                 import torch as _torch
 
@@ -670,6 +589,18 @@ class Transcriber:
                 # GIL-atomic writes — no lock needed
                 self._sb_lang = iso
                 self._sb_confidence = prob
+                scores = prediction[0].reshape(-1).exp().cpu()
+                labels = language_id.hparams.label_encoder.decode_torch(
+                    _torch.arange(len(scores))
+                )
+                probabilities = {}
+                for label, score in zip(labels, scores.tolist()):
+                    code = label.split(":")[0].strip()
+                    code = _SB_LANG_FIXES.get(code, code)
+                    probabilities[code] = probabilities.get(code, 0.0) + score
+                evidence = LanguageEvidence(captured_at, probabilities)
+                # Publish one coherent immutable history snapshot without locks.
+                self._sb_history = (*self._sb_history, evidence)[-8:]
             except Exception as exc:
                 logger.error("LangID inference error: %s", exc, exc_info=True)
 
@@ -687,105 +618,114 @@ class Transcriber:
         # _detected_lang lives exclusively on this thread — no lock needed.
         # We also expose it as _vad_lang for the VAD thread to read cheaply.
 
+        pending = collections.deque()
         while not self._stop_event.is_set():
-            try:
-                item = self._infer_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            kind = item[0]
-
-            match kind:
-                case "stop":
+            if not pending:
+                try:
+                    pending.append(self._infer_queue.get(timeout=0.2))
+                except queue.Empty:
+                    continue
+            while True:
+                try:
+                    pending.append(self._infer_queue.get_nowait())
+                except queue.Empty:
                     break
-
-                case "detect":
-                    _, audio = item
-                    self._infer_detect(whisper_model, audio)
-
-                case "reset_lang":
-                    # Silence expired — forget cached language so the next
-                    # utterance re-detects from scratch without the two-pass
-                    # threshold working against a stale value.
-                    logger.debug(
-                        "Inference: resetting _detected_lang (was %s) on silence expiry.",
-                        self._detected_lang,
-                    )
-                    self._detected_lang = None
-                    self._detected_confidence = None
-                    self._last_speaker_embed = None  # speaker context also stale
-                    self._initial_prompt = (
-                        ""  # context no longer relevant after long silence
-                    )
-                    self._last_partial_text = ""
-                    self._stuck_partial_count = 0
-                    self._commit_requested.clear()
-                    # Clear speech buffer so the next speaker starts fresh
-                    # without the previous speaker's audio biasing detection.
-                    self._speech_buffer.clear()
-                    self._speech_buffer_secs = 0.0
-
-                case "partial":
-                    _, audio, lang = item
-                    # Skip this partial only if a commit is already queued
-                    # (it would be stale by the time we finish inference).
-                    # Drain any intermediate partial/detect items to find out.
-                    commit_pending = None
-                    while True:
-                        try:
-                            nxt = self._infer_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        match nxt[0]:
-                            case "partial" | "detect":
-                                # Discard older partials — superseded by this one
-                                # or by the upcoming commit.
-                                logger.debug(
-                                    "Inference: discarding stale %s item.", nxt[0]
-                                )
-                            case _:
-                                # commit or stop — put it back and stop draining
-                                commit_pending = nxt
-                                self._infer_queue.put(nxt)
-                                break
-
-                    if commit_pending is None:
-                        # No commit waiting — run this partial.
-                        self._infer_partial(whisper_model, audio, lang)
-                    else:
-                        logger.debug(
-                            "Inference: skipping partial — commit already queued."
+            pending = collections.deque(coalesce_inference_work(pending))
+            item = pending.popleft()
+            kind = item[0]
+            if kind == "stop":
+                break
+            if kind == "reset_lang":
+                self._reset_language_context(item[1] if len(item) > 1 else None)
+            elif kind == "detect":
+                self._infer_detect(
+                    whisper_model, item[1], item[2] if len(item) > 2 else None
+                )
+            elif kind == "partial":
+                if self._partials_enabled:
+                    started = time.monotonic()
+                    self._infer_partial(whisper_model, item[1], item[2])
+                    if len(item[1]) >= 2 * WHISPER_RATE:
+                        self._partials_enabled = (
+                            time.monotonic() - started
+                            < self._rolling_commit_seconds * 0.25
                         )
+            elif kind == "commit":
+                captured_at = item[3] if len(item) > 3 else time.monotonic()
+                started = time.monotonic()
+                queue_delay = max(0.0, started - captured_at)
+                self._quality_retry_allowed = queue_delay < 1.0 and not any(
+                    work[0] == "commit" for work in pending
+                )
+                revision = self._speech_buffer_revision
+                self._infer_commit(whisper_model, item[1], item[2], captured_at)
+                if len(item) > 4 and item[4] and self.on_non_speech:
+                    # Deliver the boundary after its transcript, preserving FIFO.
+                    self.on_non_speech("utterance_end")
+                if self._speech_buffer_revision != revision:
+                    # Detection owns language state and sees newly confirmed speech,
+                    # even when VAD detection requests were coalesced under load.
+                    self._infer_detect(whisper_model, item[1], captured_at)
+                processing = time.monotonic() - started
+                audio_seconds = len(item[1]) / WHISPER_RATE
+                self._partials_enabled = processing < audio_seconds * 0.25
+                # Amortize fixed encoder cost on slow hardware without letting
+                # continuous speech wait the old seven seconds on fast models.
+                target = min(8.0, max(ROLLING_COMMIT_S, processing * 1.25))
+                self._rolling_commit_seconds = (
+                    0.7 * self._rolling_commit_seconds + 0.3 * target
+                )
+                logger.debug(
+                    "Realtime: audio=%.2fs processing=%.2fs queue=%.2fs lag=%.2fs window=%.1fs partials=%s",
+                    audio_seconds,
+                    processing,
+                    queue_delay,
+                    max(0.0, time.monotonic() - captured_at),
+                    self._rolling_commit_seconds,
+                    self._partials_enabled,
+                )
 
-                case "commit":
-                    _, audio, lang = item
-                    # Drain all stale partial/detect items ahead of next commit.
-                    while True:
-                        try:
-                            nxt = self._infer_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        match nxt[0]:
-                            case "partial" | "detect":
-                                logger.debug(
-                                    "Inference: discarding stale %s before commit.",
-                                    nxt[0],
-                                )
-                            case _:
-                                # another commit or stop — put it back
-                                self._infer_queue.put(nxt)
-                                break
-                    self._infer_commit(whisper_model, audio, lang)
+    def _reset_language_context(self, captured_at=None):
+        logger.debug("Resetting language context after silence")
+        self._language_reset_at = (
+            captured_at if captured_at is not None else time.monotonic()
+        )
+        self._detected_lang = None
+        self._detected_confidence = None
+        self._detected_lang_set_at = 0.0
+        self._vad_lang = None
+        self._language_candidate = None
+        self._language_candidate_hits = 0
+        self._last_detect_evidence = None
+        self._last_language_inference_at = 0.0
+        self._last_transcribed_lang = None
+        self._last_speaker_embed = None
+        self._initial_prompt = ""
+        self._initial_prompt_lang = None
+        self._last_partial_text = ""
+        self._stuck_partial_count = 0
+        self._commit_requested.clear()
+        self._speech_buffer.clear()
+        self._speech_buffer_secs = 0.0
+        self._speech_buffer_at = 0.0
+        self._speech_buffer_revision += 1
+
+        if self.on_non_speech:
+            self.on_non_speech("silence")
 
     # ------------------------------------------------------------------
 
-    def _push_speech_buffer(self, audio: np.ndarray) -> None:
+    def _push_speech_buffer(self, audio: np.ndarray, captured_at=None) -> None:
         """Append confirmed-speech audio to the rolling language-detection buffer.
 
         Called by _infer_commit after at least one segment is emitted.
         Evicts the oldest chunks when the buffer exceeds LANG_BUFFER_MAX_SECS.
         Inference thread only — no locking required.
         """
+        self._speech_buffer_revision += 1
+        self._speech_buffer_at = (
+            captured_at if captured_at is not None else time.monotonic()
+        )
         secs = len(audio) / WHISPER_RATE
         self._speech_buffer.append(audio)
         self._speech_buffer_secs += secs
@@ -797,244 +737,136 @@ class Transcriber:
         """Return audio to use for language detection.
 
         If the speech buffer has at least LANG_BUFFER_MIN_SECS of confirmed
-        speech, concatenate and return it (trimmed to LANG_BUFFER_MAX_SECS).
+        speech, return the most recent LANG_DETECT_WINDOW_SECS of that buffer.
         Otherwise return the raw VAD snapshot passed as fallback.
         """
         if self._speech_buffer_secs >= LANG_BUFFER_MIN_SECS:
             combined = np.concatenate(list(self._speech_buffer))
-            max_samples = int(LANG_BUFFER_MAX_SECS * WHISPER_RATE)
+            # Prefer the newest utterance. Only borrow older confirmed speech
+            # to reach five seconds, rather than letting old speakers dominate.
+            max_samples = max(
+                int(LANG_BUFFER_MIN_SECS * WHISPER_RATE),
+                min(
+                    int(LANG_DETECT_WINDOW_SECS * WHISPER_RATE),
+                    len(self._speech_buffer[-1]),
+                ),
+            )
             if len(combined) > max_samples:
                 combined = combined[-max_samples:]
             logger.debug(
-                "Lang detect on speech buffer (%.1fs)", self._speech_buffer_secs
+                "Lang detect on recent confirmed speech (%.1fs)",
+                len(combined) / WHISPER_RATE,
             )
             return combined
         return fallback
 
-    def _infer_detect(self, model, audio: np.ndarray) -> None:
-        """Run detect_language and update _detected_lang / _vad_lang.
+    def _speechbrain_evidence(self, captured_at):
+        return closest_language_evidence(
+            self._sb_history, captured_at, self._language_reset_at
+        )
 
-        A staleness check at the top clears _detected_lang if it has not been
-        confirmed by a confident detection for more than LANG_STALE_SECONDS.
-        This prevents a wrong language (e.g. 'uk' detected on noisy audio)
-        from persisting indefinitely when subsequent detections lack confidence.
+    def _result_confidence(self, language, captured_at=None):
+        if language == self._detected_lang:
+            return self._detected_confidence
+        evidence = self._speechbrain_evidence(
+            captured_at if captured_at is not None else time.monotonic()
+        )
+        if evidence and evidence.probabilities:
+            top = max(evidence.probabilities, key=evidence.probabilities.get)
+            if top == language:
+                return evidence.probabilities[top]
+        return None
 
-        Confidence thresholds
-        ---------------------
-        >= 0.80  — accept immediately (high confidence).
-        0.65–0.80 — ambiguous zone: run a second detect pass on a shifted
-                    time window of the same audio clip.  Accept the new
-                    language only if both passes agree (same lang, both
-                    >= 0.65).  This catches genuine language switches that
-                    fall just below the single-pass threshold (e.g. the
-                    first 1.5 s of Farsi after a long English utterance)
-                    while still rejecting noisy low-confidence flips.
-        < 0.65   — reject outright; keep current language.
-        """
-        import time as _time
-
-        # Use the rolling speech buffer when it has enough confirmed speech.
-        # This replaces the raw 3-second VAD snapshot with 5–30 seconds of
-        # actual spoken audio, making detection far more reliable.
-        audio = self._buffer_audio_for_detect(audio)
-
-        # Staleness check: if _detected_lang hasn't been confirmed by a
-        # confident detection within LANG_STALE_SECONDS, clear it so the next
-        # commit auto-detects from scratch instead of being forced into the
-        # wrong language.
+    def _infer_detect(self, model, audio: np.ndarray, captured_at=None) -> None:
+        """Detect from recent confirmed speech, with aligned audio evidence."""
+        now = time.monotonic()
+        captured_at = captured_at if captured_at is not None else now
         if (
             self._detected_lang is not None
-            and self._detected_lang_set_at > 0.0
-            and (_time.monotonic() - self._detected_lang_set_at) > LANG_STALE_SECONDS
+            and now - self._detected_lang_set_at > LANG_STALE_SECONDS
         ):
-            logger.debug(
-                "Language '%s' stale (>%.0fs without confident confirmation) — clearing.",
-                self._detected_lang,
-                LANG_STALE_SECONDS,
-            )
             self._detected_lang = None
             self._detected_confidence = None
-            self._detected_lang_set_at = 0.0
             self._vad_lang = None
-
+        use_buffer = self._speech_buffer_secs >= LANG_BUFFER_MIN_SECS
+        audio = self._buffer_audio_for_detect(audio)
+        if use_buffer:
+            captured_at = self._speech_buffer_at
+        evidence_key = (
+            ("speech", self._speech_buffer_revision)
+            if use_buffer
+            else ("snapshot", captured_at)
+        )
+        if evidence_key == self._last_detect_evidence:
+            return
+        sb = self._speechbrain_evidence(captured_at)
+        if (
+            sb
+            and self._detected_lang is not None
+            and self._last_transcribed_lang == self._detected_lang
+            and (self._detected_confidence or 0.0) >= 0.8
+            and now - self._last_language_inference_at < 10.0
+            and max(sb.probabilities, key=sb.probabilities.get) == self._detected_lang
+            and sb.probabilities[self._detected_lang] >= 0.8
+        ):
+            return
+        if len(audio) < WHISPER_RATE:
+            return
         try:
             import whisper as _whisper
 
-            def _detect_on_slice(sliced: np.ndarray) -> tuple:
-                """Return (lang, confidence) for a given audio slice."""
-                mel = _whisper.log_mel_spectrogram(
-                    torch.from_numpy(sliced).to(model.device),
-                    n_mels=model.dims.n_mels,
+            if not use_buffer:
+                audio = _normalize_audio(audio, float(np.sqrt(np.mean(audio**2))))
+            # Match Whisper.transcribe's padding exactly, allowing encoder reuse.
+            mel = _whisper.log_mel_spectrogram(
+                torch.from_numpy(audio),
+                n_mels=model.dims.n_mels,
+                padding=_whisper.audio.N_SAMPLES,
+            )
+            mel = (
+                _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
+                .to(
+                    device=model.device,
+                    dtype=torch.float16 if self._fp16 else torch.float32,
                 )
-                mel = _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
-                mel = mel.unsqueeze(0)
-                _, probs_list = model.detect_language(mel)
-                probs = probs_list[0]
-                top = max(probs, key=probs.get)
-                return top, probs[top]
-
-            lang, confidence = _detect_on_slice(audio)
-            logger.debug("Language detection: %s (p=%.2f)", lang, confidence)
-
-            # ── Fuse with SpeechBrain LangID result (if available) ──────────
-            # _sb_lang/_sb_confidence are written by the LangID thread; reads
-            # here are GIL-atomic in CPython (no lock needed).
-            # SpeechBrain is purpose-built for spoken language ID (6.7% error
-            # on VoxLingua107 dev set, 107 languages) so it gets a higher
-            # weight when both detectors agree.
-            sb_lang = self._sb_lang
-            sb_conf = self._sb_confidence
-            if sb_lang is not None and sb_conf is not None:
-                if sb_lang == lang:
-                    # Agreement: weighted average, biased toward SpeechBrain.
-                    combined = (
-                        LANGID_WEIGHT_WH * confidence + LANGID_WEIGHT_SB * sb_conf
-                    )
-                    logger.debug(
-                        "LangID fusion (agree %s): wh=%.2f sb=%.2f → %.2f",
-                        lang,
-                        confidence,
-                        sb_conf,
-                        combined,
-                    )
-                    confidence = combined
+                .unsqueeze(0)
+            )
+            _, probabilities = model.detect_language(mel)
+            self._last_language_inference_at = time.monotonic()
+            whisper_probs = probabilities[0]
+            sb = self._speechbrain_evidence(captured_at)
+            lang, confidence, margin, agreement = fuse_language_probabilities(
+                whisper_probs, sb.probabilities if sb else None
+            )
+            self._last_detect_evidence = evidence_key
+            logger.debug(
+                "Language evidence: lang=%s confidence=%.2f margin=%.2f agreement=%s sb_age=%s",
+                lang,
+                confidence,
+                margin,
+                agreement,
+                round(captured_at - sb.captured_at, 1) if sb else None,
+            )
+            if lang is None or confidence < 0.65 or margin < 0.15:
+                self._language_candidate = None
+                self._language_candidate_hits = 0
+                return
+            accept = self._detected_lang in (None, lang)
+            accept = accept or (confidence >= 0.85 and agreement) or confidence >= 0.95
+            if not accept:
+                if self._language_candidate == lang:
+                    self._language_candidate_hits += 1
                 else:
-                    # Disagreement: take the higher-confidence result but
-                    # discount it to reflect the uncertainty.
-                    wh_lang_orig, wh_conf_orig = lang, confidence
-                    if sb_conf > confidence:
-                        lang = sb_lang
-                        confidence = sb_conf * LANGID_DISAGREE_DISCOUNT
-                    else:
-                        confidence = confidence * LANGID_DISAGREE_DISCOUNT
-                    logger.debug(
-                        "LangID fusion (disagree): wh=%s(%.2f) sb=%s(%.2f) → %s(%.2f)",
-                        wh_lang_orig,
-                        wh_conf_orig,
-                        sb_lang,
-                        sb_conf,
-                        lang,
-                        confidence,
-                    )
-
-            MIN_CONFIDENT = 0.80
-            MIN_AMBIGUOUS = 0.65
-
-            if self._detected_lang is None or lang == self._detected_lang:
-                # No existing language, or same language confirmed — accept if
-                # confidence meets the minimum bar.
-                if confidence >= MIN_AMBIGUOUS:
-                    self._detected_lang = lang
-                    self._detected_confidence = confidence
-                    self._detected_lang_set_at = _time.monotonic()
-                    self._vad_lang = lang
-                elif confidence < 0.40:
-                    # Very low confidence even for the cached language means
-                    # Whisper is >60% sure this is NOT the cached language.
-                    # Clear the cache so the next commit auto-detects on the
-                    # full audio rather than being forced into the wrong language.
-                    logger.debug(
-                        "Confidence %.2f very low for cached lang '%s' — "
-                        "clearing cache to force auto-detect on next commit.",
-                        confidence,
-                        self._detected_lang,
-                    )
-                    self._detected_lang = None
-                    self._detected_confidence = None
-                    self._vad_lang = None
-                else:
-                    logger.debug(
-                        "Language detection rejected — confidence %.2f < %.2f; keeping %s.",
-                        confidence,
-                        MIN_AMBIGUOUS,
-                        self._detected_lang,
-                    )
-            elif confidence >= MIN_CONFIDENT:
-                # High-confidence switch to a different language — accept.
+                    self._language_candidate = lang
+                    self._language_candidate_hits = 1
+                accept = self._language_candidate_hits >= 2
+            if accept:
                 self._detected_lang = lang
                 self._detected_confidence = confidence
-                self._detected_lang_set_at = _time.monotonic()
+                self._detected_lang_set_at = now
                 self._vad_lang = lang
-            elif confidence >= MIN_AMBIGUOUS:
-                # Ambiguous zone: the detected lang differs from current and
-                # confidence is 0.65–0.80.  Run a second pass on a shifted
-                # window (skip first 0.5 s) to get a second opinion.
-                offset = int(0.5 * WHISPER_RATE)
-                if len(audio) > offset + WHISPER_RATE // 4:
-                    audio2 = audio[offset:]
-                    lang2, conf2 = _detect_on_slice(audio2)
-                    logger.debug(
-                        "Language detection (2nd pass): %s (p=%.2f)", lang2, conf2
-                    )
-                    if lang2 == lang and conf2 >= MIN_AMBIGUOUS:
-                        # Both passes agree on the new language — accept.
-                        combined = (confidence + conf2) / 2
-                        logger.debug(
-                            "Language switch confirmed by 2nd pass: %s→%s "
-                            "(p1=%.2f p2=%.2f avg=%.2f).",
-                            self._detected_lang,
-                            lang,
-                            confidence,
-                            conf2,
-                            combined,
-                        )
-                        self._detected_lang = lang
-                        self._detected_confidence = combined
-                        self._detected_lang_set_at = _time.monotonic()
-                        self._vad_lang = lang
-                    else:
-                        logger.debug(
-                            "Language detection rejected — ambiguous and 2nd pass "
-                            "disagrees (%s p=%.2f vs %s p=%.2f); keeping %s.",
-                            lang,
-                            confidence,
-                            lang2,
-                            conf2,
-                            self._detected_lang,
-                        )
-                        # Detector saw a different language twice — reduce cached
-                        # confidence so the next commit uses Whisper auto-detect
-                        # on the full utterance audio instead of forcing the stale
-                        # language.  Auto-detect on 5-7 s is far more reliable than
-                        # the 3 s snapshot used here.
-                        if self._detected_confidence is not None:
-                            self._detected_confidence = min(
-                                self._detected_confidence, 0.69
-                            )
-                            logger.debug(
-                                "Confidence capped to %.2f — next commit will auto-detect.",
-                                self._detected_confidence,
-                            )
-                else:
-                    logger.debug(
-                        "Language detection rejected — ambiguous (%.2f) and audio "
-                        "too short for 2nd pass; keeping %s.",
-                        confidence,
-                        self._detected_lang,
-                    )
-                    if self._detected_confidence is not None:
-                        self._detected_confidence = min(self._detected_confidence, 0.69)
-                        logger.debug(
-                            "Confidence capped to %.2f — next commit will auto-detect.",
-                            self._detected_confidence,
-                        )
-            else:
-                logger.debug(
-                    "Language detection rejected — confidence %.2f < %.2f; keeping %s.",
-                    confidence,
-                    MIN_AMBIGUOUS,
-                    self._detected_lang,
-                )
-                # Even a below-threshold signal for a *different* language is a
-                # reason to be less certain.  Cap confidence so the commit path
-                # falls back to Whisper auto-detect on the full audio.
-                if self._detected_confidence is not None and confidence >= 0.45:
-                    self._detected_confidence = min(self._detected_confidence, 0.69)
-                    logger.debug(
-                        "Confidence capped to %.2f — next commit will auto-detect.",
-                        self._detected_confidence,
-                    )
-
+                self._language_candidate = None
+                self._language_candidate_hits = 0
         except Exception as exc:
             logger.error("Language detection error: %s", exc, exc_info=True)
 
@@ -1042,7 +874,7 @@ class Transcriber:
         """Run a fast greedy pass and fire on_partial."""
         if not self.on_partial:
             return
-        if len(audio) < WHISPER_RATE // 2:
+        if len(audio) < 2 * WHISPER_RATE:
             logger.debug("Partial skipped — audio too short (%d samples).", len(audio))
             return
         rms = float(np.sqrt(np.mean(audio**2)))
@@ -1057,23 +889,20 @@ class Transcriber:
         # Never force language on partials — let Whisper auto-detect per window.
         # Forcing a stale or wrong detected language causes Whisper to translate
         # instead of transcribe, or output garbage when the language changes.
-        partial_lang: Optional[str] = None
-        use_initial_prompt = False
-
         audio = _normalize_audio(audio, rms)
         try:
             result = model.transcribe(
                 audio,
                 task="transcribe",
-                language=partial_lang,
-                fp16=self.device != "cpu",
-                temperature=(0.0, 0.2),
+                language=None,
+                fp16=self._fp16,
+                temperature=0.0,
                 beam_size=1,
-                no_speech_threshold=1.0,  # disable internal suppression; our own filter handles it
+                no_speech_threshold=0.6,
                 logprob_threshold=-1.0,
-                compression_ratio_threshold=1.8,
-                initial_prompt=self._initial_prompt if use_initial_prompt else None,
-                condition_on_previous_text=use_initial_prompt,
+                compression_ratio_threshold=2.4,
+                initial_prompt=None,
+                condition_on_previous_text=False,
                 verbose=False,
             )
         except Exception as exc:
@@ -1092,21 +921,14 @@ class Transcriber:
             seg_text = str(seg.get("text", "")).strip()
             if not seg_text:
                 continue
-            if seg.get("no_speech_prob", 0.0) > 0.7:
-                logger.debug(
-                    "Partial segment skipped — no_speech_prob=%.3f text=%r",
-                    seg.get("no_speech_prob", 0.0),
-                    seg_text[:60],
-                )
+            if segment_confidence_reason(seg) is not None:
                 continue
-            if _is_noise_token(seg_text):
-                continue
-            if seg.get("avg_logprob", 0.0) < AVG_LOGPROB_THRESHOLD:
+            if _is_noise_token(seg_text) or _is_repetition_loop(seg_text):
                 continue
             filtered_parts.append(seg_text)
 
         text: str = " ".join(filtered_parts).strip()
-        if not text:
+        if not text and not segments:
             # Fall back to raw text only if there are no segments (shouldn't
             # normally happen) and the raw text passes basic checks.
             raw = str(result.get("text", "")).strip()
@@ -1145,30 +967,37 @@ class Transcriber:
                     text[:60],
                 )
                 return
-            self.on_partial(result_lang, text, self._detected_confidence)
+            self.on_partial(result_lang, text, self._result_confidence(result_lang))
         else:
             logger.debug("Partial returned no usable segments.")
 
     def _compute_speaker_embed(
-        self, model, audio: np.ndarray
+        self, model, audio: np.ndarray, reuse_last=False
     ) -> Optional[torch.Tensor]:
         """Return a normalised mean-pooled encoder embedding for the audio.
 
-        Uses model.embed_audio() which runs only the encoder (no decoder),
-        so it adds minimal latency on top of the transcribe() call.
+        After decoding, reuse its encoder features. Standalone callers can
+        still request a new encoder pass for the supplied audio.
 
         Returns None if the encoding fails.
         """
         try:
             import whisper as _whisper
 
-            audio_t = torch.from_numpy(audio).to(model.device)
-            mel = _whisper.log_mel_spectrogram(audio_t, n_mels=model.dims.n_mels)
-            mel = _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
-            mel = mel.unsqueeze(0)  # [1, n_mels, N_FRAMES]
-
-            with torch.no_grad():
-                enc = model.embed_audio(mel)  # [1, T, n_state]
+            enc = getattr(model.encoder, "last_features", None) if reuse_last else None
+            if not isinstance(enc, torch.Tensor):
+                audio_t = torch.from_numpy(audio)
+                mel = _whisper.log_mel_spectrogram(
+                    audio_t, n_mels=model.dims.n_mels, padding=_whisper.audio.N_SAMPLES
+                )
+                mel = (
+                    _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
+                    .to(model.device)
+                    .unsqueeze(0)
+                )
+                with torch.no_grad():
+                    enc = model.embed_audio(mel)
+            enc = enc.float()
 
             # Mean-pool over time dimension, then L2-normalise.
             pooled = enc.mean(dim=1)  # [1, n_state]
@@ -1178,13 +1007,72 @@ class Transcriber:
             logger.warning("Speaker embed failed: %s", exc)
             return None
 
-    def _infer_commit(self, model, audio: np.ndarray, lang: Optional[str]) -> None:
+    def _transcription_quality(self, result):
+        weighted, total = 0.0, 0
+        for segment in result.get("segments", []):
+            text = str(segment.get("text", "")).strip()
+            reason = segment_confidence_reason(segment)
+            if not text or _is_noise_token(text) or _is_repetition_loop(text):
+                continue
+            if reason not in (None, "low_confidence"):
+                continue
+            weight = max(1, len(segment.get("tokens", [])) or len(text))
+            weighted += float(segment.get("avg_logprob", 0.0)) * weight
+            total += weight
+        return weighted / total if total else float("-inf")
+
+    def _decode_commit(self, model, audio):
+        options = dict(
+            task="transcribe",
+            language=None,
+            fp16=self._fp16,
+            temperature=0.0,
+            beam_size=1,
+            no_speech_threshold=0.6,
+            logprob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            initial_prompt=None,
+            condition_on_previous_text=False,
+            verbose=False,
+        )
+        started = time.monotonic()
+        result = model.transcribe(audio, **options)
+        elapsed = time.monotonic() - started
+        quality = self._transcription_quality(result)
+        if (
+            self._quality_retry_allowed
+            and elapsed <= len(audio) / WHISPER_RATE * 0.2
+            and len(audio) >= int(1.5 * WHISPER_RATE)
+            and -1.5 <= quality < -0.65
+        ):
+            # Spend extra decoding work only on uncertain speech, never on
+            # noise-only output or every already-confident utterance.
+            options["beam_size"] = 3
+            try:
+                candidate = model.transcribe(audio, **options)
+                improved = self._transcription_quality(candidate)
+                if improved > quality + 0.05:
+                    logger.debug(
+                        "Beam retry improved transcript score %.3f → %.3f",
+                        quality,
+                        improved,
+                    )
+                    result = candidate
+            except Exception:
+                logger.warning(
+                    "Quality retry failed; keeping the first decode", exc_info=True
+                )
+        return result
+
+    def _infer_commit(
+        self, model, audio: np.ndarray, lang: Optional[str], captured_at=None
+    ) -> None:
         """Run a final Whisper pass, detect speaker change, and fire on_result.
 
         Speaker-change detection
         ------------------------
-        After a successful transcribe() call, the encoder is run a second time
-        on the same (normalised) audio to obtain a mean-pooled embedding.
+        After a successful transcribe() call, its encoder features are reused
+        to obtain a mean-pooled embedding without another inference pass.
         Cosine similarity is computed against the embedding from the previous
         utterance.  If it falls below SPEAKER_CHANGE_THRESHOLD the
         on_speaker_change callback is fired *before* on_result so that the UI
@@ -1219,31 +1107,6 @@ class Transcriber:
         if lang is None:
             lang = self._detected_lang
 
-        # If we still have no language (very short first utterance before any
-        # detection has ever run), do a quick inline detect now so that
-        # transcribe() gets a language hint rather than having to guess.
-        if lang is None:
-            try:
-                import whisper as _whisper
-
-                detect_audio = audio[: int(DETECT_SECONDS * WHISPER_RATE)]
-                mel = _whisper.log_mel_spectrogram(
-                    torch.from_numpy(detect_audio).to(model.device),
-                    n_mels=model.dims.n_mels,
-                )
-                mel = _whisper.pad_or_trim(mel, _whisper.audio.N_FRAMES)
-                mel = mel.unsqueeze(0)
-                _, probs_list = model.detect_language(mel)
-                probs = probs_list[0]
-                lang = max(probs, key=probs.get)
-                confidence = probs[lang]
-                self._detected_lang = lang
-                self._detected_confidence = confidence
-                self._vad_lang = lang
-                logger.debug("Commit inline detect: %s (p=%.2f)", lang, confidence)
-            except Exception as exc:
-                logger.warning("Inline detect failed: %s", exc)
-
         # Never force the language on commits.  With task="transcribe" and
         # language=None, Whisper auto-detects the language per commit window
         # and transcribes in that language — it does NOT translate.  Forcing
@@ -1252,7 +1115,6 @@ class Transcriber:
         # is actually a translation) or produce low-logprob phonetic garbage
         # that our filter then drops.  Both outcomes are worse than letting
         # Whisper pick the language itself from the actual audio.
-        commit_lang: Optional[str] = None
         logger.debug("Commit: using Whisper auto-detect (lang hint=%s)", lang)
 
         # Never pass initial_prompt to commits.  With multilingual audio the
@@ -1272,46 +1134,34 @@ class Transcriber:
 
         try:
             t0 = time.monotonic()
-            source_result = model.transcribe(
-                audio,
-                task="transcribe",
-                language=commit_lang,
-                fp16=self.device != "cpu",
-                temperature=(0.0, 0.2),
-                beam_size=1,
-                no_speech_threshold=1.0,  # disable internal suppression; our own filter handles it
-                logprob_threshold=-1.0,
-                compression_ratio_threshold=1.8,
-                initial_prompt=None,
-                condition_on_previous_text=False,
-                verbose=False,
-            )
+            source_result = self._decode_commit(model, audio)
 
             detected_lang: str = str(source_result.get("language") or "?")
+            self._last_transcribed_lang = detected_lang
             raw_text: str = str(source_result.get("text", ""))
             source_text: str = raw_text.strip()
 
-            # ── Lingua text-based language cross-check ───────────────────
-            # Lingua's rule engine recognises script characters immediately
-            # (e.g. Arabic/Persian script → 'fa'/'ar' at confidence 1.0).
-            # This catches the edge case where Whisper correctly transcribes
-            # the script but still labels the segment with the wrong language
-            # tag.  Only override when text is long enough to be reliable and
-            # Lingua is confident (>= 0.70 — enforced inside _lingua_detect).
+            # Text can corroborate an audio decision, but fluent generated
+            # text alone is not evidence that this language was actually spoken.
             if len(source_text) >= 15:
                 lingua_lang = _lingua_detect(source_text)
-                if lingua_lang is not None and lingua_lang != detected_lang:
-                    logger.info(
-                        "Lingua overrides Whisper lang %s → %s for text %r",
-                        detected_lang,
-                        lingua_lang,
-                        source_text[:50],
+                evidence = self._speechbrain_evidence(
+                    captured_at if captured_at is not None else time.monotonic()
+                )
+                if lingua_lang and lingua_lang != detected_lang and evidence:
+                    audio_lang = max(
+                        evidence.probabilities, key=evidence.probabilities.get
                     )
-                    detected_lang = lingua_lang
-                elif lingua_lang:
-                    logger.debug(
-                        "Lingua confirms lang=%s for %r", lingua_lang, source_text[:30]
-                    )
+                    if (
+                        audio_lang == lingua_lang
+                        and evidence.probabilities[audio_lang] >= 0.8
+                    ):
+                        logger.debug(
+                            "Audio and text corroborate language %s instead of %s",
+                            lingua_lang,
+                            detected_lang,
+                        )
+                        detected_lang = lingua_lang
 
             segments = source_result.get("segments", [])
 
@@ -1349,12 +1199,12 @@ class Transcriber:
             )
 
             # ── Speaker-change detection ────────────────────────────────
-            # Compute encoder embedding for this utterance and compare to
-            # the previous one.  We do this AFTER transcribe() so the
-            # encoder result can be reused (embed_audio is a separate call
-            # but re-uses the already-loaded model weights on device).
+            # Reuse the current decode's features before any later language
+            # request changes the encoder cache's most recent entry.
             if self.on_speaker_change:
-                current_embed = self._compute_speaker_embed(model, audio)
+                current_embed = self._compute_speaker_embed(
+                    model, audio, reuse_last=True
+                )
                 if current_embed is not None:
                     if self._last_speaker_embed is not None:
                         sim = float(
@@ -1385,59 +1235,17 @@ class Transcriber:
                     seg_text = str(seg.get("text", "")).strip()
                     if not seg_text:
                         continue
-                    # Skip segments Whisper flagged as likely silence/noise.
-                    if seg.get("no_speech_prob", 0) > 0.7:
+                    reason = segment_confidence_reason(seg)
+                    if reason is None and _is_noise_token(seg_text):
+                        reason = "noise"
+                    if reason is None and _is_repetition_loop(seg_text):
+                        reason = "repetition"
+                    if reason:
                         logger.debug(
-                            "  segment skipped — no_speech_prob=%.3f text=%r",
-                            seg.get("no_speech_prob", 0),
+                            "  segment skipped — %s avg_logprob=%.3f text=%r",
+                            reason,
+                            seg.get("avg_logprob", 0.0),
                             seg_text[:60],
-                        )
-                        continue
-                    # Skip segments that are pure music/noise bracket tokens
-                    # (e.g. "[Music]", "♪ … ♪", "[Applause]").
-                    if _is_noise_token(seg_text):
-                        logger.debug(
-                            "  segment skipped — noise token: %r", seg_text[:60]
-                        )
-                        continue
-                    # Skip low-confidence segments likely produced by music or
-                    # background noise.  avg_logprob below AVG_LOGPROB_THRESHOLD
-                    # (-0.65) indicates the decoder was uncertain — hallucinated
-                    # speech during music falls in this range.
-                    seg_logprob = seg.get("avg_logprob", 0.0)
-                    if seg_logprob < AVG_LOGPROB_THRESHOLD:
-                        # Before discarding, try a per-segment Lingua rescue.
-                        # If Lingua confidently identifies the segment text as a
-                        # *different* language from Whisper's detected_lang, the
-                        # low logprob is an artefact of wrong-language mode —
-                        # rescue it up to a looser threshold.
-                        rescued = False
-                        if (
-                            len(seg_text) >= 8
-                            and seg_logprob >= AVG_LOGPROB_RESCUE_THRESHOLD
-                        ):
-                            seg_lingua = _lingua_detect(seg_text)
-                            if seg_lingua is not None and seg_lingua != detected_lang:
-                                logger.debug(
-                                    "  segment rescued — Lingua=%s≠Whisper=%s avg_logprob=%.3f text=%r",
-                                    seg_lingua,
-                                    detected_lang,
-                                    seg_logprob,
-                                    seg_text[:60],
-                                )
-                                rescued = True
-                        if not rescued:
-                            logger.debug(
-                                "  segment skipped — avg_logprob=%.3f (<%.2f) text=%r",
-                                seg_logprob,
-                                AVG_LOGPROB_THRESHOLD,
-                                seg_text[:60],
-                            )
-                            continue
-                    # Skip hallucination repetition loops.
-                    if _is_repetition_loop(seg_text):
-                        logger.debug(
-                            "  segment skipped — repetition loop: %r", seg_text[:60]
                         )
                         continue
                     logger.debug(
@@ -1452,18 +1260,26 @@ class Transcriber:
                     joined = " ".join(kept_texts)
                     sentences = _split_sentences(joined)
                     logger.debug(
-                        "  emitting %d sentence(s) from %d segment(s): %r",
+                        "  emitting %d text part(s) from %d segment(s): %r",
                         len(sentences),
                         len(kept_texts),
                         joined[:80],
                     )
                     for sent in sentences:
-                        self.on_result(detected_lang, sent, self._detected_confidence)
+                        self.on_result(
+                            detected_lang,
+                            sent,
+                            self._result_confidence(detected_lang, captured_at),
+                        )
                     any_emitted = True
             else:
-                if not _is_repetition_loop(source_text):
+                if not _is_repetition_loop(source_text) and not _is_noise_token(
+                    source_text
+                ):
                     self.on_result(
-                        detected_lang, source_text, self._detected_confidence
+                        detected_lang,
+                        source_text,
+                        self._result_confidence(detected_lang, captured_at),
                     )
                     any_emitted = True
                 else:
@@ -1476,24 +1292,28 @@ class Transcriber:
                 self.on_non_speech("no_speech")
             elif any_emitted:
                 # Push confirmed speech into the rolling language-detection buffer.
-                self._push_speech_buffer(audio)
+                self._push_speech_buffer(audio, captured_at)
                 self._last_partial_text = ""
                 self._stuck_partial_count = 0
 
         except Exception as exc:
             logger.error("Whisper inference error: %s", exc, exc_info=True)
-            # Reset so the next utterance re-detects from scratch.
-            self._detected_lang = None
-            self._detected_confidence = None
-            self._vad_lang = None
-            try:
-                self.on_result("?", "", None)
-            except Exception:
-                pass  # app may already be shut down
+            # Reset through the inference work channel, never mutate detection
+            # state from a commit (including its error path).
+            self._infer_queue.put(("reset_lang", time.monotonic()))
+            if self.on_non_speech:
+                self.on_non_speech("inference_error")
 
     # ------------------------------------------------------------------
     # VAD thread  (never touches Whisper)
     # ------------------------------------------------------------------
+
+    def _queue_commit(self, audio, lang, boundary=False, captured_at=None):
+        """Give both detectors matching audio/time and preserve pause boundaries."""
+        captured_at = captured_at if captured_at is not None else time.monotonic()
+        if len(audio) >= 2 * WHISPER_RATE:
+            self._langid_queue.put((captured_at, audio))
+        self._infer_queue.put(("commit", audio, lang, captured_at, boundary))
 
     def _run(self) -> None:
         """VAD loop: reads audio, posts work items to _infer_queue."""
@@ -1528,31 +1348,27 @@ class Transcriber:
         _detection_triggered: bool = False
         _speech_sample_offset: int = 0
         _silence_start_time: float = time.monotonic()
+        _silence_reset_sent = True
+        _last_pause_cut = None
+        _last_pause_seconds = 0.0
 
         _vad_frame_count = 0
         _vad_prob_log_interval = 50
 
         while not self._stop_event.is_set():
+            # Capture continues delivering zero-valued chunks during silence;
+            # queue.Empty is not a reliable indication that speech has stopped.
+            now = time.monotonic()
+            if (
+                not _speech_active
+                and not _silence_reset_sent
+                and now - _silence_start_time >= SILENCE_LANG_RESET_S
+            ):
+                self._infer_queue.put(("reset_lang", now))
+                _silence_reset_sent = True
             try:
                 chunk = self.audio_queue.get(timeout=0.1)
             except queue.Empty:
-                # During silence: expire stale language cache.
-                if not _speech_active:
-                    now = time.monotonic()
-                    if now - _silence_start_time >= SILENCE_LANG_RESET_S:
-                        if self._vad_lang is not None:
-                            logger.debug(
-                                "Silence %.1fs — clearing cached lang '%s'.",
-                                now - _silence_start_time,
-                                self._vad_lang,
-                            )
-                            self._vad_lang = None
-                            # Tell the inference thread to forget its cached
-                            # language too, so the next utterance re-detects
-                            # without the two-pass threshold fighting a stale
-                            # value.  This is the only cross-thread write to
-                            # _detected_lang — done via the queue, not directly.
-                            self._infer_queue.put(("reset_lang",))
                 continue
 
             utterance.append(chunk)
@@ -1598,11 +1414,14 @@ class Transcriber:
                     _utterance_start_time = time.monotonic()
                     _last_interim_time = _utterance_start_time
                     _detection_triggered = False
+                    _last_pause_cut = None
+                    _last_pause_seconds = 0.0
 
                 elif "end" in event:
                     logger.debug("VAD end at sample %d", utterance_samples)
                     _speech_active = False
                     _silence_start_time = time.monotonic()
+                    _silence_reset_sent = False
                     _detection_triggered = False
 
                     speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
@@ -1613,7 +1432,7 @@ class Transcriber:
                     )
                     captured_lang = self._vad_lang  # GIL-atomic read
 
-                    self._infer_queue.put(("commit", audio, captured_lang))
+                    self._queue_commit(audio, captured_lang, boundary=True)
                     logger.debug(
                         "VAD end — queued commit (lang=%s, samples=%d).",
                         captured_lang,
@@ -1628,6 +1447,18 @@ class Transcriber:
                     self._vad_lang = None
 
                     vad_iter.reset_states()
+                    _last_pause_cut = None
+                    _last_pause_seconds = 0.0
+
+                if _speech_active and vad_iter.temp_end:
+                    quiet_samples = vad_iter.current_sample - vad_iter.temp_end
+                    if quiet_samples >= int(MIN_ROLLING_PAUSE_SECONDS * WHISPER_RATE):
+                        # Map Silero's sample clock into the retained utterance.
+                        processed_end = utterance_samples - (len(audio_for_vad) - i)
+                        cut = processed_end - quiet_samples + int(0.06 * WHISPER_RATE)
+                        if cut > _speech_sample_offset:
+                            _last_pause_cut = cut
+                            _last_pause_seconds = quiet_samples / WHISPER_RATE
 
             remainder = audio_for_vad[i:]
 
@@ -1642,8 +1473,11 @@ class Transcriber:
                 snapshot = np.concatenate(speech_chunks)[
                     : int(DETECT_SECONDS * WHISPER_RATE)
                 ]
-                self._infer_queue.put(("detect", snapshot))
-                self._langid_queue.put(snapshot)  # also feed SpeechBrain LangID thread
+                captured_at = time.monotonic()
+                self._infer_queue.put(("detect", snapshot, captured_at))
+                self._langid_queue.put(
+                    (captured_at, snapshot)
+                )  # also feed SpeechBrain LangID thread
                 _detection_triggered = True
                 logger.debug(
                     "VAD — queued language detection (%d samples).", len(snapshot)
@@ -1672,61 +1506,53 @@ class Transcriber:
                         lang,
                     )
 
-            # ── Content-based early commit ───────────────────────────────────
-            # Inference thread signals this when the partial transcript has
-            # been identical for CONTENT_COMMIT_STABLE_RUNS consecutive runs,
-            # meaning the speaker has stopped changing their words.
-            if _speech_active and self._commit_requested.is_set():
+            # A stable partial alone is not an acoustic boundary. Only let
+            # that hint advance a cut when Silero also observed a short pause.
+            content_commit = _speech_active and self._commit_requested.is_set()
+            if content_commit:
                 self._commit_requested.clear()
-                speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
-                if speech_chunks:
-                    audio = np.concatenate(speech_chunks)
-                    captured_lang = self._vad_lang
-                    self._infer_queue.put(("commit", audio, captured_lang))
-                    logger.debug(
-                        "Content commit — stable partial triggered early commit, lang=%s, samples=%d.",
-                        captured_lang,
-                        len(audio),
-                    )
-                # Reset buffer same as rolling commit; keep VAD state running.
-                utterance = []
-                utterance_samples = 0
-                _speech_sample_offset = 0
-                _utterance_start_time = time.monotonic()
-                _last_interim_time = _utterance_start_time
+            target_seconds = self._rolling_commit_seconds
+            if content_commit and _last_pause_cut is not None:
+                target_seconds = min(target_seconds, speech_samples / WHISPER_RATE)
 
-            # ── Rolling commit (continuous speech) ──────────────────────
-            # If speech has been active for ROLLING_COMMIT_S without a VAD
-            # silence end event (fast speaker / monologue), commit what we
-            # have and restart the buffer.  This keeps each commit to ~1–3
-            # sentences rather than a wall of text at the 25 s cap.
-            elapsed_speech = time.monotonic() - _utterance_start_time
-            if _speech_active and elapsed_speech >= ROLLING_COMMIT_S:
-                speech_chunks = _speech_chunks(utterance, _speech_sample_offset)
-                if speech_chunks:
-                    audio = np.concatenate(speech_chunks)
-                    captured_lang = self._vad_lang
-                    self._infer_queue.put(("commit", audio, captured_lang))
-                    logger.debug(
-                        "Rolling commit — %.1fs elapsed, lang=%s, samples=%d.",
-                        elapsed_speech,
-                        captured_lang,
-                        len(audio),
-                    )
-
-                # Reset buffer; keep _speech_active=True and VAD state running.
-                # Reset _detection_triggered so the next rolling window re-detects
-                # after DETECT_SECONDS of speech.  This is essential for language
-                # switching during continuous speech (e.g. Arabic → English) — the
-                # detection from the first window cannot be assumed valid for all
-                # subsequent rolling windows.
-                utterance = []
-                utterance_samples = 0
+            # Prefer a word/phrase pause around the rolling deadline. If no
+            # pause arrives within 600 ms, keep the bounded realtime hard cut.
+            boundary = (
+                rolling_audio_boundary(
+                    utterance_samples,
+                    _speech_sample_offset,
+                    target_seconds,
+                    _last_pause_cut,
+                    _last_pause_seconds,
+                    sample_rate=WHISPER_RATE,
+                )
+                if _speech_active
+                else None
+            )
+            if boundary is not None:
+                cut, utterance_end = boundary
+                buffered = np.concatenate(utterance)
+                audio = buffered[_speech_sample_offset:cut]
+                tail = buffered[cut:]
+                captured_at = time.monotonic() - len(tail) / WHISPER_RATE
+                self._queue_commit(audio, self._vad_lang, utterance_end, captured_at)
+                logger.debug(
+                    "Rolling commit — %.1fs, pause=%s, retained=%.2fs, utterance_end=%s",
+                    len(audio) / WHISPER_RATE,
+                    round(_last_pause_seconds, 3) if cut != len(buffered) else None,
+                    len(tail) / WHISPER_RATE,
+                    utterance_end,
+                )
+                # Carry the suffix intact: never discard audio captured after
+                # the selected pause, or repeat it in the committed prefix.
+                utterance = [tail] if len(tail) else []
+                utterance_samples = len(tail)
                 _speech_sample_offset = 0
+                _utterance_start_time = captured_at
+                _last_interim_time = time.monotonic()
                 _detection_triggered = False
-                _utterance_start_time = time.monotonic()
-                _last_interim_time = _utterance_start_time
-                # Keep _vad_lang: detection result still valid until overridden.
+                _last_pause_cut = None
+                _last_pause_seconds = 0.0
 
             # ── Safety cap (wall-clock) ─────────────────────────────────
             elif (
@@ -1751,7 +1577,7 @@ class Transcriber:
                 )
                 captured_lang = self._vad_lang
 
-                self._infer_queue.put(("commit", audio, captured_lang))
+                self._queue_commit(audio, captured_lang)
                 logger.debug(
                     "Force-emit — queued commit (lang=%s, samples=%d).",
                     captured_lang,
@@ -1765,6 +1591,8 @@ class Transcriber:
                 utterance = []
                 utterance_samples = 0
                 _speech_sample_offset = 0
+                _last_pause_cut = None
+                _last_pause_seconds = 0.0
                 _utterance_start_time = time.monotonic()
                 _last_interim_time = _utterance_start_time
                 # Keep _vad_lang: detection result still valid for next segment.
@@ -1803,16 +1631,16 @@ def _speech_chunks(
 
 
 def _normalize_audio(audio: np.ndarray, rms: float) -> np.ndarray:
-    """Scale audio so its RMS is ~0.2, clamped to [-1, 1].
-
-    Whisper's no-speech classifier and decoder both perform best when speech
-    is at a moderate amplitude (roughly rms=0.1–0.3).  Audio captured via a
-    line input at low gain (rms~0.04) is quiet enough that the encoder output
-    distribution shifts and the decoder produces empty results.  A simple RMS
-    normalisation to a fixed target level fixes this without distortion for
-    speech-range signals.
-    """
-    TARGET_RMS = 0.2
-    if rms <= 0:
-        return audio
-    return np.clip(audio * (TARGET_RMS / rms), -1.0, 1.0).astype(np.float32)
+    """Apply bounded gain without flattening speech peaks through clipping."""
+    clean = np.nan_to_num(
+        np.asarray(audio, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    if not len(clean):
+        return clean
+    if not np.isfinite(rms) or rms <= 0:
+        rms = float(np.sqrt(np.mean(clean**2)))
+    peak = float(np.max(np.abs(clean)))
+    if rms <= 0 or peak <= 0:
+        return clean
+    gain = min(0.2 / rms, 8.0, 0.98 / peak)
+    return (clean * gain).astype(np.float32)

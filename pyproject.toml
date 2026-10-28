@@ -7,28 +7,30 @@ dependencies = [
     "argostranslate>=1.11.0",
     "deep-translator>=1.11.4",
     "lingua-language-detector>=2.2.0",
+    "numpy",
+    "openai-whisper",
+    "openvino>=2026.4.1; (sys_platform == 'linux' or sys_platform == 'win32') and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
     "pulsectl>=24.12.0",
+    "rich>=15.0.0",
+    "scipy",
+    "silero-vad>=6.2.3",
     "sounddevice>=0.5.5",
     "speechbrain>=1.1.0",
+    "textual>=8.2.8",
+    "torch",
+    "torchaudio",
 ]
 
 [project.scripts]
 polyglot = "app:main"
 
-[tool.uv]
-# Packages already installed system-wide via pacman (python-pytorch-rocm etc.)
-# Marking them as excluded prevents uv from overriding them with PyPI versions.
-exclude-dependencies = [
-    "torch",
-    "numpy",
-    "scipy",
-    "networkx",
-    "sympy",
-    "tqdm",
-    "pyyaml",
-    "regex",
-    "filelock",
-    "packaging",
-    "requests",
-    "triton",
-]
+# Keep PyTorch and its audio extension on matching CPU builds by default.
+# See https://docs.astral.sh/uv/guides/integration/pytorch/ for GPU indexes.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

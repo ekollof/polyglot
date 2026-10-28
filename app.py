@@ -29,6 +29,7 @@ import threading
 from typing import Optional
 
 from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -43,17 +44,17 @@ from textual.widgets import (
 )
 from textual.widgets._select import SelectOverlay  # type: ignore[attr-defined]
 from textual.widgets.option_list import Option  # type: ignore[attr-defined]
-from textual import work
 
-from audio import AudioCapture, list_input_devices, default_device
+from audio import AudioCapture, default_device, list_input_devices
+from sentence_buffer import SentenceBuffer
 from transcriber import Transcriber
 from translator import (
-    Translator,
-    ENGINE_GOOGLE,
-    ENGINE_MYMEMORY,
-    ENGINE_LIBRETRANSLATE,
-    ENGINE_OLLAMA,
     ENGINE_ARGOS,
+    ENGINE_GOOGLE,
+    ENGINE_LIBRETRANSLATE,
+    ENGINE_MYMEMORY,
+    ENGINE_OLLAMA,
+    Translator,
 )
 
 logging.basicConfig(
@@ -492,6 +493,7 @@ class PolyglotApp(App):
 
         # Last finalised source text, used as context for the next translation
         # so the translator can resolve sentence continuations and pronouns.
+        self._sentence_buffer = SentenceBuffer()
         self._last_source_text: str = ""  # retained for potential future use
 
     # ------------------------------------------------------------------
@@ -587,7 +589,6 @@ class PolyglotApp(App):
             on_speaker_change=self._on_speaker_change,
             on_non_speech=self._on_non_speech,
             model_name=self._model_name,
-            device="cuda",
         )
         self._transcriber.start()
         self._poll_model_ready()
@@ -605,6 +606,7 @@ class PolyglotApp(App):
 
     def _restart_transcriber(self) -> None:
         """Stop the current transcriber and start a new one with the selected model."""
+        self._flush_sentence_buffer()
         self._model_ready = False
         self._update_status()
         if self._transcriber:
@@ -616,7 +618,6 @@ class PolyglotApp(App):
             on_speaker_change=self._on_speaker_change,
             on_non_speech=self._on_non_speech,
             model_name=self._model_name,
-            device="cuda",
         )
         self._transcriber.start()
         self._poll_model_ready()
@@ -628,48 +629,57 @@ class PolyglotApp(App):
     def _on_partial_result(
         self, detected_lang: str, partial_text: str, confidence: Optional[float]
     ) -> None:
-        """Called by Transcriber thread with each interim partial transcription."""
-        self._detected_lang = detected_lang
-        row_id = self._next_row_id  # reuse the same row until finalised
-        self.call_from_thread(self._show_partial, row_id, partial_text, detected_lang)
+        """Preview live audio alongside confirmed unfinished sentence text."""
+        self.call_from_thread(self._show_live_partial, partial_text, detected_lang)
 
-        # Partial translations are intentionally NOT submitted to the translation
-        # worker. Submitting partials causes slot/strip position races between
-        # _show_partial and _finalise_source on the main thread. The translation
-        # pane shows "…" (dim) while an utterance is in progress; the final
-        # translation arrives after the utterance is committed.
+    def _show_live_partial(self, partial_text: str, detected_lang: str) -> None:
+        text, language = self._sentence_buffer.preview(partial_text, detected_lang)
+        self._show_partial(self._next_row_id, text, language)
 
     def _on_transcription_result(
-        self,
-        detected_lang: str,
-        source_text: str,
-        confidence: Optional[float],
+        self, detected_lang: str, source_text: str, confidence: Optional[float]
     ) -> None:
-        """Called by Transcriber thread when an utterance is fully transcribed."""
-        self._detected_lang = detected_lang
-        target = self._target_lang
+        """Move confirmed chunks to the UI-owned sentence buffer."""
+        self.call_from_thread(
+            self._accept_transcription, detected_lang, source_text, confidence
+        )
 
+    def _accept_transcription(self, detected_lang, source_text, confidence) -> None:
+        if not source_text.strip():
+            return
+        for sentence in self._sentence_buffer.push(
+            source_text, detected_lang, confidence
+        ):
+            self._submit_sentence(sentence)
+        if self._sentence_buffer.pending:
+            self._show_partial(
+                self._next_row_id,
+                self._sentence_buffer.pending,
+                self._sentence_buffer.language,
+            )
+
+    def _submit_sentence(self, sentence) -> None:
         row_id = self._next_row_id
         self._next_row_id += 1
-
-        self.call_from_thread(self._finalise_source, row_id, source_text, detected_lang)
-
-        # Empty source_text means _commit failed (inference error) — the partial
-        # has been cleared; nothing to translate.
-        if not source_text:
-            return
-
-        self._last_source_text = source_text
-
+        # Register a keyed slot before any worker can deliver a translation.
+        self._finalise_source(row_id, sentence.text, sentence.language)
+        self._last_source_text = sentence.text
         assert self._translation_worker is not None
         self._translation_worker.submit(
             row_id=row_id,
-            text=source_text,
-            from_lang=detected_lang,
-            to_lang=target,
+            text=sentence.text,
+            from_lang=sentence.language,
+            to_lang=self._target_lang,
             is_final=True,
-            confidence=confidence,
+            confidence=sentence.confidence,
         )
+
+    def _flush_sentence_buffer(self) -> None:
+        ready = self._sentence_buffer.flush()
+        for sentence in ready:
+            self._submit_sentence(sentence)
+        if not ready and self._pending_row_id is not None:
+            self._finalise_source(self._next_row_id, "", self._detected_lang)
 
     # ------------------------------------------------------------------
     # Speaker-change / non-speech callbacks (called from transcriber thread)
@@ -680,8 +690,10 @@ class PolyglotApp(App):
         self.call_from_thread(self._insert_speaker_separator)
 
     def _on_non_speech(self, reason: str) -> None:
-        """Called by Transcriber when an utterance is classified as non-speech."""
-        logger.debug("Non-speech utterance suppressed (%s).", reason)
+        """Handle rejected audio and ordered acoustic utterance boundaries."""
+        logger.debug("Transcription boundary/status: %s", reason)
+        if reason in ("silence", "utterance_end", "inference_error"):
+            self.call_from_thread(self._flush_sentence_buffer)
 
     # ------------------------------------------------------------------
     # Translation callback (called from TranslationWorker thread)
@@ -725,6 +737,7 @@ class PolyglotApp(App):
         Both are treated as finalised rows — they have no translation slot and
         will never be rewritten.
         """
+        self._flush_sentence_buffer()
         source_log = self.query_one("#source-log", RichLog)
         trans_log = self.query_one("#translation-log", RichLog)
 
@@ -900,7 +913,14 @@ class PolyglotApp(App):
         # by the translation text in normal (or dim italic for partials) style.
         line = _make_lang_tag_line(translation, from_lang, confidence, is_final)
         trans_log.write(line)
-        # slot_start now holds the translation; tail starts at slot_start + 1.
+        # A full sentence may wrap; shift slots by its actual rendered height.
+        shift = len(trans_log.lines) - slot_start - 1
+        if shift:
+            for pending_id, position in list(self._trans_slots.items()):
+                if pending_id != row_id and position > slot_start:
+                    self._trans_slots[pending_id] = position + shift
+            if self._trans_strip_start > slot_start:
+                self._trans_strip_start += shift
 
         # Re-append the tail lines.
         if tail_lines:
@@ -911,21 +931,6 @@ class PolyglotApp(App):
                 height=len(trans_log.lines)
             )
             trans_log.refresh()
-
-            # Update every downstream slot index.  Each slot that was after
-            # slot_start was shifted: old position → same absolute position
-            # (the translation replaced the "…" 1-for-1, so no net shift).
-            # But if we removed N tail lines and re-appended N tail lines the
-            # absolute positions are unchanged — no adjustment needed for those.
-            # The only slot whose index changes is the one we just resolved
-            # (row_id itself), which we remove below.
-
-            # Update _trans_strip_start if the dim partial was in the tail.
-            # The partial's position relative to slot_start is preserved.
-            if self._trans_strip_start > slot_start:
-                # Partial was in the tail; its absolute index is unchanged
-                # because we replaced the "…" 1-for-1 (no net line count shift).
-                pass  # _trans_strip_start stays correct
 
         if is_final:
             self._trans_slots.pop(row_id, None)
@@ -945,8 +950,6 @@ class PolyglotApp(App):
         # called directly from a UI event handler) OR from a background thread
         # (network probe, argostranslate download).  Textual's call_from_thread
         # raises RuntimeError when called from the main thread, so branch on it.
-        import threading
-
         if threading.current_thread() is threading.main_thread():
             self._set_status(message, "status-loading")
         else:
@@ -964,6 +967,8 @@ class PolyglotApp(App):
             # Ignore clicks on group-header sentinel options
             if new_idx < 0:
                 return
+            if new_idx != self._current_device_index:
+                self._flush_sentence_buffer()
             self._current_device_index = new_idx
             if self._capture:
                 self._capture.set_device(new_idx)
@@ -972,6 +977,7 @@ class PolyglotApp(App):
         elif event.select.id == "lang-select":
             if event.value is Select.BLANK:
                 return
+            self._flush_sentence_buffer()
             self._target_lang = str(event.value)
             # Pre-download argostranslate package if needed
             detected = self._detected_lang if self._detected_lang != "?" else "en"
@@ -991,6 +997,7 @@ class PolyglotApp(App):
                 return
             new_engine = str(event.value)
             if new_engine != self._engine:
+                self._flush_sentence_buffer()
                 self._engine = new_engine
                 self._translator.set_engine(new_engine)
 
@@ -1012,6 +1019,7 @@ class PolyglotApp(App):
         self._trans_slot_order.clear()
         self._row_count = 0
         self._last_source_text = ""
+        self._sentence_buffer.clear()
 
     def action_focus_source(self) -> None:
         self.query_one("#source-select").focus()
@@ -1044,7 +1052,8 @@ class PolyglotApp(App):
             else "detecting…"
         )
         self._set_status(
-            f"● Listening — {device_name} — {lang_info} → {target_name}",
+            f"● Listening — {device_name} — {lang_info} → {target_name}"
+            f" — {self._transcriber.backend_name if self._transcriber else 'CPU'}",
             "status-listening",
         )
 
