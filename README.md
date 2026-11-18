@@ -232,6 +232,8 @@ Audio gain is capped and limited by the signal's peak instead of clipping amplif
 
 These safeguards target the observed failure modes, rather than guaranteeing a particular word error rate. Difficult utterances can take longer because of the bounded retry; model size, recording quality, accents and code switching still affect accuracy.
 
+Utterances shorter than one second are held and merged with the next commit instead of being decoded alone — sub-second fragments were the main source of low-confidence drops. A silence boundary flushes the held audio. The rolling detector's language survives short pauses as a decoding hint (a hinted decode is re-run with auto-detection when it scores worse), and a commit whose dominant script contradicts the confident language is vetoed rather than emitted as foreign-script text.
+
 ## Translation sentence boundaries
 
 Rolling audio windows are processing boundaries, rather than sentence boundaries. Confirmed text ending in `...` or `…` is held and joined to the next confirmed chunk. Ellipses at the join are removed, while internal punctuation is retained. Abbreviations, decimals, closing quotes, and common non-Latin sentence punctuation are handled before a sentence is submitted for translation.

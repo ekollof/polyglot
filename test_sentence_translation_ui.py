@@ -255,6 +255,28 @@ class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
             values = [value for _, value in app._device_options()]
             self.assertIn(3, values)
 
+    async def test_language_and_speaker_changes_keep_every_sentence(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._accept_transcription("fa", "این نیمه جمله", 0.9)
+            # Language switches before the sentence is complete.
+            app._accept_transcription("en", "First full sentence.", 0.9)
+            app._accept_transcription("en", "Second unfinished", 0.9)
+            app._insert_speaker_separator()
+            submitted = [
+                call.kwargs["text"]
+                for call in app._translation_worker.submit.call_args_list
+            ]
+            self.assertIn("این نیمه جمله", submitted)
+            self.assertIn("First full sentence.", submitted)
+            self.assertIn("Second unfinished", submitted)
+            source = "\n".join(
+                line.text for line in app.query_one("#source-log", RichLog).lines
+            )
+            for text in ("این نیمه جمله", "First full sentence.", "Second unfinished"):
+                self.assertIn(text, source)
+
     async def test_target_switch_flushes_under_old_target_and_clear_drops_tail(self):
         app = self.make_app()
         async with app.run_test(size=(140, 40)) as pilot:

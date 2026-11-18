@@ -38,8 +38,11 @@ class CommitLanguageHintTests(unittest.TestCase):
         self.transcriber._ready.set()
 
     def test_confident_detection_is_used_as_hint(self):
+        import time
+
         self.transcriber._detected_lang = "fa"
         self.transcriber._detected_confidence = 0.97
+        self.transcriber._detected_lang_set_at = time.monotonic()
         self.assertEqual(self.transcriber._commit_language_hint(None), "fa")
 
     def test_uncertain_detection_leaves_auto_detection_alone(self):
@@ -54,6 +57,30 @@ class CommitLanguageHintTests(unittest.TestCase):
         )
         self.assertIsNone(self.transcriber._detected_lang)
         self.assertEqual(self.transcriber._commit_language_hint(now), "fa")
+
+    def test_language_survives_a_short_silence(self):
+        import time
+
+        self.transcriber._detected_lang = "fa"
+        self.transcriber._detected_confidence = 0.97
+        self.transcriber._detected_lang_set_at = time.monotonic()
+        self.transcriber._speech_buffer.append(np.zeros(16000, dtype=np.float32))
+        self.transcriber._speech_buffer_secs = 1.0
+        self.transcriber._reset_language_context()
+        self.assertEqual(self.transcriber._commit_language_hint(None), "fa")
+        self.assertEqual(self.transcriber._speech_buffer_secs, 0.0)
+
+    def test_stale_language_is_not_used_as_a_hint(self):
+        import time
+
+        from transcriber import LANG_STALE_SECONDS
+
+        self.transcriber._detected_lang = "fa"
+        self.transcriber._detected_confidence = 0.97
+        self.transcriber._detected_lang_set_at = time.monotonic() - (
+            LANG_STALE_SECONDS + 1
+        )
+        self.assertIsNone(self.transcriber._commit_language_hint(None))
 
     def test_hinted_decode_is_used_without_a_second_pass(self):
         hinted = {

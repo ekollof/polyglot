@@ -58,7 +58,9 @@ Do not introduce `threading.Lock`, semaphores, or any explicit synchronisation. 
 - It is updated **only** by `_infer_detect()`, never by `_infer_commit()`
 - `_infer_detect()` uses `_buffer_audio_for_detect()` which returns the rolling speech buffer (≥5 s of confirmed speech) instead of raw VAD snapshots
 - After each successful commit (`any_emitted=True`), audio is pushed to `_speech_buffer` via `_push_speech_buffer()`
-- The buffer is cleared on `reset_lang` (long silence)
+- The buffer is cleared on `reset_lang` (long silence), but `_detected_lang`/`_detected_confidence` are **kept** so the next short commit decodes with the known language instead of a fresh 1–2 s auto-detect; `LANG_STALE_SECONDS` expires the hint and `_infer_detect()` overrides it when the next speaker confirms another language
+- Boundary commits shorter than `MIN_COMMIT_SECONDS` are held in `_held_audio` and merged into the next commit; `reset_lang` flushes the held fragment with `force=True`
+- A commit whose dominant script contradicts the confident language is vetoed (`_script_mismatch`) and reported as `no_speech` instead of being emitted
 
 ### Translation pane
 - Each committed utterance gets a pre-allocated slot in `_trans_slots` (row_id → line index)

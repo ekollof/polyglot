@@ -315,14 +315,18 @@ class SpeechQualityTests(unittest.TestCase):
         self.assertEqual(transcriber._detected_lang, "it")
         self.assertEqual(model.detect_language.call_count, 3)
 
-    def test_reset_invalidates_language_and_old_audio_evidence(self):
+    def test_reset_keeps_the_language_but_invalidates_old_audio_evidence(self):
         transcriber = self.transcriber()
         transcriber._detected_lang = "en"
+        transcriber._detected_confidence = 0.95
         transcriber._vad_lang = "en"
         transcriber._sb_history = (LanguageEvidence(99, {"en": 0.99}),)
         transcriber._push_speech_buffer(np.ones(WHISPER_RATE), 99)
         transcriber._reset_language_context(100)
-        self.assertIsNone(transcriber._detected_lang)
+        # The hint survives a pause so the next short commit is not decoded
+        # with a fresh, unreliable auto-detection (see _commit_language_hint).
+        self.assertEqual(transcriber._detected_lang, "en")
+        self.assertEqual(transcriber._detected_confidence, 0.95)
         self.assertIsNone(transcriber._vad_lang)
         self.assertIsNone(transcriber._speechbrain_evidence(101))
         self.assertFalse(transcriber._speech_buffer)
@@ -410,6 +414,70 @@ class SpeechQualityTests(unittest.TestCase):
         transcriber.on_result.assert_not_called()
         transcriber.on_non_speech.assert_called_once_with("inference_error")
 
+    def test_commit_with_a_contradicting_script_is_vetoed(self):
+        transcriber = self.transcriber()
+        transcriber._detected_lang = "fa"
+        transcriber._detected_confidence = 0.99
+        import time
+
+        transcriber._detected_lang_set_at = time.monotonic()
+        model = Mock()
+        model.transcribe.return_value = transcript(
+            text="This is clearly English text.", language="en"
+        )
+        with patch("transcriber._lingua_detect", return_value=None):
+            transcriber._infer_commit(
+                model,
+                np.ones(2 * WHISPER_RATE, dtype=np.float32) * 0.1,
+                None,
+                time.monotonic(),
+            )
+        transcriber.on_result.assert_not_called()
+        transcriber.on_non_speech.assert_called_with("no_speech")
+
+    def test_matching_script_is_not_vetoed(self):
+        transcriber = self.transcriber()
+        transcriber._detected_lang = "fa"
+        transcriber._detected_confidence = 0.99
+        import time
+
+        transcriber._detected_lang_set_at = time.monotonic()
+        model = Mock()
+        model.transcribe.return_value = transcript(
+            text="این یک جمله فارسی است.", language="fa"
+        )
+        with patch("transcriber._lingua_detect", return_value=None):
+            transcriber._infer_commit(
+                model,
+                np.ones(2 * WHISPER_RATE, dtype=np.float32) * 0.1,
+                None,
+                time.monotonic(),
+            )
+        transcriber.on_result.assert_called_once()
+
+    def test_short_commits_are_held_and_merged(self):
+        transcriber = self.transcriber()
+        model = Mock()
+        model.transcribe.return_value = transcript(text="Hello there.")
+        short = np.ones(int(0.6 * WHISPER_RATE), dtype=np.float32) * 0.1
+        transcriber._infer_commit(model, short, None, 100, boundary=True)
+        model.transcribe.assert_not_called()
+        self.assertIsNotNone(transcriber._held_audio)
+        transcriber._infer_commit(model, short, None, 101, boundary=True)
+        model.transcribe.assert_called_once()
+        decoded = model.transcribe.call_args.args[0]
+        self.assertAlmostEqual(len(decoded) / WHISPER_RATE, 1.2, places=1)
+        self.assertIsNone(transcriber._held_audio)
+
+    def test_forced_commit_decodes_a_held_fragment(self):
+        transcriber = self.transcriber()
+        model = Mock()
+        model.transcribe.return_value = transcript(text="Hello there.")
+        short = np.ones(int(0.6 * WHISPER_RATE), dtype=np.float32) * 0.1
+        transcriber._infer_commit(model, short, None, 100, boundary=True)
+        transcriber._infer_commit(model, short, None, 101, boundary=True, force=True)
+        model.transcribe.assert_called_once()
+
     def test_text_language_override_requires_matching_audio_evidence(self):
         for evidence_time, expected in ((99, "fa"), (80, "en")):
             with self.subTest(evidence_time=evidence_time):
@@ -419,7 +487,7 @@ class SpeechQualityTests(unittest.TestCase):
                 )
                 model = Mock()
                 model.transcribe.return_value = transcript(
-                    text="A sufficiently long transcription."
+                    text="این یک متن کاملاً فارسی است.", language="en"
                 )
                 with patch("transcriber._lingua_detect", return_value="fa"):
                     transcriber._infer_commit(

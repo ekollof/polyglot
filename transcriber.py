@@ -191,6 +191,11 @@ COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE: float = 0.8
 # a stale hint (speaker switch, music) cannot force the wrong language.
 COMMIT_LANGUAGE_RETRY_QUALITY: float = -0.65
 
+# Utterances shorter than this are held and merged with the next commit.
+# Whisper has too little context below it: short fragments after a pause were
+# the main source of low-confidence drops and language hallucinations.
+MIN_COMMIT_SECONDS: float = 1.0
+
 
 def _is_noise_token(text: str) -> bool:
     """Return True if *text* consists entirely of Whisper noise/music tokens."""
@@ -233,6 +238,90 @@ def _partial_script_mismatch(text: str, expected_lang: Optional[str]) -> bool:
     else:
         # Expect Latin script; suppress if mostly Arabic.
         return arabic_count / total > 0.6
+
+
+# Language families by script.  Used to veto committed text whose script
+# contradicts the language the rolling detector is confident about.
+_LANG_SCRIPT: dict[str, str] = {
+    **{
+        code: "latin"
+        for code in (
+            "en es fr de it pt nl sv da no fi pl cs sk hu ro tr id ms vi tl ca "
+            "eu gl af sq hr bs sl sw uz az et lt lv is mt cy ga"
+        ).split()
+    },
+    **{code: "arabic" for code in "fa ar ur ps ug ku sd".split()},
+    **{code: "cyrillic" for code in "ru uk bg sr mk be kk mn".split()},
+    **{code: "devanagari" for code in "hi mr ne".split()},
+    **{code: "cjk" for code in "zh ja ko".split()},
+    "el": "greek",
+    "he": "hebrew",
+    "bn": "bengali",
+    "gu": "gujarati",
+    "pa": "gurmukhi",
+    "ta": "tamil",
+    "te": "telugu",
+    "ml": "malayalam",
+    "si": "sinhala",
+    "th": "thai",
+    "ka": "georgian",
+    "hy": "armenian",
+}
+
+_SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = (
+    (0x0041, 0x024F, "latin"),
+    (0x0370, 0x03FF, "greek"),
+    (0x0400, 0x052F, "cyrillic"),
+    (0x0530, 0x058F, "armenian"),
+    (0x0590, 0x05FF, "hebrew"),
+    (0x0600, 0x06FF, "arabic"),
+    (0x0750, 0x077F, "arabic"),
+    (0x0900, 0x097F, "devanagari"),
+    (0x0980, 0x09FF, "bengali"),
+    (0x0A00, 0x0A7F, "gurmukhi"),
+    (0x0A80, 0x0AFF, "gujarati"),
+    (0x0B80, 0x0BFF, "tamil"),
+    (0x0C00, 0x0C7F, "telugu"),
+    (0x0D00, 0x0D7F, "malayalam"),
+    (0x0D80, 0x0DFF, "sinhala"),
+    (0x0E00, 0x0E7F, "thai"),
+    (0x10A0, 0x10FF, "georgian"),
+    (0x3040, 0x30FF, "cjk"),
+    (0x4E00, 0x9FFF, "cjk"),
+    (0xAC00, 0xD7AF, "cjk"),
+    (0xFB50, 0xFDFF, "arabic"),
+    (0xFE70, 0xFEFF, "arabic"),
+)
+
+
+def _char_script(character: str) -> Optional[str]:
+    code = ord(character)
+    for start, end, name in _SCRIPT_RANGES:
+        if start <= code <= end:
+            return name
+    return None
+
+
+def _dominant_script(text: str, min_letters: int = 8) -> Optional[str]:
+    counts: dict[str, int] = {}
+    for character in text:
+        script = _char_script(character)
+        if script:
+            counts[script] = counts.get(script, 0) + 1
+    if sum(counts.values()) < min_letters:
+        return None
+    return max(counts, key=counts.get)
+
+
+def _script_mismatch(text: str, expected_lang: Optional[str]) -> bool:
+    """True when *text*'s script contradicts the expected language's script."""
+    if not text or not expected_lang:
+        return False
+    expected = _LANG_SCRIPT.get(expected_lang)
+    if expected is None:
+        return False
+    dominant = _dominant_script(text)
+    return dominant is not None and dominant != expected
 
 
 def _is_repetition_loop(text: str, min_repeats: int = 3) -> bool:
@@ -383,6 +472,10 @@ class Transcriber:
         self._rolling_commit_seconds = ROLLING_COMMIT_S
         self._partials_enabled = True
         self._quality_retry_allowed = True
+        # Short commits are held here until the next one so Whisper gets
+        # enough context; see MIN_COMMIT_SECONDS.
+        self._held_audio: Optional[np.ndarray] = None
+        self._held_at = 0.0
         self._last_language_inference_at = 0.0
         self._last_transcribed_lang = None
         self.device = (
@@ -644,6 +737,17 @@ class Transcriber:
             if kind == "stop":
                 break
             if kind == "reset_lang":
+                # Decode a held short fragment before its context is cleared.
+                if self._held_audio is not None:
+                    held = self._held_audio
+                    self._held_audio = None
+                    self._infer_commit(
+                        whisper_model,
+                        held,
+                        self._detected_lang,
+                        self._held_at,
+                        force=True,
+                    )
                 self._reset_language_context(item[1] if len(item) > 1 else None)
             elif kind == "detect":
                 self._infer_detect(
@@ -698,9 +802,12 @@ class Transcriber:
         self._language_reset_at = (
             captured_at if captured_at is not None else time.monotonic()
         )
-        self._detected_lang = None
-        self._detected_confidence = None
-        self._detected_lang_set_at = 0.0
+        # Keep _detected_lang/_detected_confidence/_detected_lang_set_at across
+        # short silences.  Clearing them made the first commit after every
+        # pause auto-detect on 1-2 s of audio, which mis-labelled speech as
+        # English/French/Turkish and the confidence filter then dropped it.
+        # LANG_STALE_SECONDS still expires the hint, and _infer_detect
+        # overrides it as soon as the next speaker confirms another language.
         self._vad_lang = None
         self._language_candidate = None
         self._language_candidate_hits = 0
@@ -712,6 +819,7 @@ class Transcriber:
         self._initial_prompt_lang = None
         self._last_partial_text = ""
         self._stuck_partial_count = 0
+        self._held_audio = None
         self._commit_requested.clear()
         self._speech_buffer.clear()
         self._speech_buffer_secs = 0.0
@@ -1040,7 +1148,11 @@ class Transcriber:
         worse, so a speaker switch is still handled.
         """
         confidence = self._detected_confidence or 0.0
-        if self._detected_lang and confidence >= COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE:
+        fresh = (
+            self._detected_lang is not None
+            and time.monotonic() - self._detected_lang_set_at <= LANG_STALE_SECONDS
+        )
+        if fresh and confidence >= COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE:
             return self._detected_lang
         evidence = self._speechbrain_evidence(
             captured_at if captured_at is not None else time.monotonic()
@@ -1115,7 +1227,13 @@ class Transcriber:
         return result
 
     def _infer_commit(
-        self, model, audio: np.ndarray, lang: Optional[str], captured_at=None
+        self,
+        model,
+        audio: np.ndarray,
+        lang: Optional[str],
+        captured_at=None,
+        boundary: bool = True,
+        force: bool = False,
     ) -> None:
         """Run a final Whisper pass, detect speaker change, and fire on_result.
 
@@ -1139,14 +1257,38 @@ class Transcriber:
         if len(audio) > MAX_WHISPER_SAMPLES:
             audio = audio[-MAX_WHISPER_SAMPLES:]
 
-        if len(audio) < WHISPER_RATE // 2:
-            return
+        # Merge a held fragment with this commit before deciding anything.
+        if self._held_audio is not None:
+            audio = np.concatenate([self._held_audio, audio])
+            captured_at = captured_at or self._held_at
+            self._held_audio = None
 
         rms = float(np.sqrt(np.mean(audio**2)))
         if rms < 1e-4:
             logger.debug("Utterance is silence (rms=%.6f), skipping.", rms)
             if self.on_non_speech:
                 self.on_non_speech("silence")
+            return
+
+        # Whisper has too little context on sub-second fragments: they score
+        # low and get dropped, or hallucinate a different language.  Hold them
+        # until the next commit; a silence reset flushes the tail.
+        if (
+            not force
+            and boundary
+            and len(audio) < int(MIN_COMMIT_SECONDS * WHISPER_RATE)
+        ):
+            self._held_audio = audio
+            self._held_at = (
+                captured_at if captured_at is not None else time.monotonic()
+            )
+            logger.debug(
+                "Holding %.1fs utterance for the next commit",
+                len(audio) / WHISPER_RATE,
+            )
+            return
+
+        if len(audio) < WHISPER_RATE // 2:
             return
 
         audio = _normalize_audio(audio, rms)
@@ -1311,22 +1453,38 @@ class Transcriber:
 
                 if kept_texts:
                     joined = " ".join(kept_texts)
-                    sentences = _split_sentences(joined)
-                    logger.debug(
-                        "  emitting %d text part(s) from %d segment(s): %r",
-                        len(sentences),
-                        len(kept_texts),
-                        joined[:80],
-                    )
-                    for sent in sentences:
-                        self.on_result(
-                            detected_lang,
-                            sent,
-                            self._result_confidence(detected_lang, captured_at),
+                    if hint and _script_mismatch(joined, hint):
+                        logger.debug(
+                            "  commit vetoed — %s script while %s is active: %r",
+                            _dominant_script(joined),
+                            hint,
+                            joined[:60],
                         )
-                    any_emitted = True
+                        kept_texts = []
+                    else:
+                        sentences = _split_sentences(joined)
+                        logger.debug(
+                            "  emitting %d text part(s) from %d segment(s): %r",
+                            len(sentences),
+                            len(kept_texts),
+                            joined[:80],
+                        )
+                        for sent in sentences:
+                            self.on_result(
+                                detected_lang,
+                                sent,
+                                self._result_confidence(detected_lang, captured_at),
+                            )
+                        any_emitted = True
             else:
-                if not _is_repetition_loop(source_text) and not _is_noise_token(
+                if hint and _script_mismatch(source_text, hint):
+                    logger.debug(
+                        "  commit vetoed — %s script while %s is active: %r",
+                        _dominant_script(source_text),
+                        hint,
+                        source_text[:60],
+                    )
+                elif not _is_repetition_loop(source_text) and not _is_noise_token(
                     source_text
                 ):
                     self.on_result(
