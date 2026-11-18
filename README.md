@@ -19,7 +19,8 @@ Listens to any audio source (applications, monitors, hardware inputs), transcrib
 - **Auto language detection** — no need to tell it what language is being spoken; switches mid-stream
 - **Real-time partials** — dim italic in-progress text appears while speech is ongoing
 - **Sentence-based translation** — unfinished text is joined across rolling audio chunks before translation, with completed sentences translated concurrently
-- **Multiple translation engines** — Google, MyMemory, LibreTranslate, Ollama (local LLM), Argos (fully offline)
+- **Multiple translation engines** — Ollama (default), NLLB-200, OpenAI-compatible endpoints, Google, MyMemory, LibreTranslate, Argos; missing models download on demand after a confirmation dialog
+- **Passive audio capture** — taps PipeWire sources (applications, monitors) through JACK; never opens a raw ALSA device, so other applications keep playing
 - **Robust language ID** — detection runs on a rolling 5–30 s buffer of confirmed speech rather than raw 3 s VAD snapshots
 - **Script-mismatch suppression** — Latin-script partials are suppressed when the active language is Arabic/Persian-script and vice versa
 - **Speaker-change detection** — visual separator inserted when encoder embeddings differ between utterances
@@ -29,9 +30,10 @@ Listens to any audio source (applications, monitors, hardware inputs), transcrib
 
 - Python ≥ 3.14
 - [uv](https://github.com/astral-sh/uv) (package/venv manager)
-- PulseAudio or PipeWire-Pulse
-- `ffmpeg` (used internally by Whisper)
-- Internet access for Google/MyMemory translation (Argos/Ollama work offline)
+- PipeWire with its PulseAudio compatibility layer (capture is a passive JACK tap on PipeWire)
+- `ffmpeg` (used internally by Whisper), PortAudio
+- [Ollama](https://ollama.com) for the default translation engine (optional; models download on demand)
+- Internet only for Google/MyMemory/LibreTranslate translation; everything else runs locally
 
 ### Inference backends
 
@@ -87,7 +89,7 @@ Without the script, `uv sync` builds the CPU/OpenVINO environment:
 uv sync
 ```
 
-`uv sync` installs the Python dependencies, including Textual, NumPy, SciPy, Whisper, Silero VAD, and OpenVINO, into `.venv`. System Python packages and access to another user's model cache are not required. Install `ffmpeg`, PortAudio, and PulseAudio or PipeWire-Pulse using your distro's package manager.
+`uv sync` installs the Python dependencies, including Textual, NumPy, SciPy, Whisper, Silero VAD, and OpenVINO, into `.venv`. System Python packages and access to another user's model cache are not required. Install `ffmpeg`, PortAudio, and PulseAudio or PipeWire-Pulse using your distro's package manager. On a machine with an accelerated GPU, prefer `./install.sh`: plain `uv sync` installs the CPU wheels and Polyglot falls back to OpenVINO CPU.
 
 ### Using a distro ROCm PyTorch (AMD)
 
@@ -100,6 +102,24 @@ uv sync --no-install-package torch --no-install-package torchaudio --no-install-
 
 All three exclusions matter: the venv must not shadow the system `torch`, `torchaudio`, or `triton`. The locked `triton` is built for the CPU wheel and fails ROCm kernel compilation with `PassManager::run failed`, which makes Whisper's warmup fail and silently demotes the run to OpenVINO CPU. `uv sync` installs the excluded packages again unless the flags are repeated, and `uv run` syncs before running, so start the app with `uv run --no-sync python app.py` or `.venv/bin/python app.py`. The log then reports `Whisper model loaded — PyTorch ROCm` with FP16 enabled.
 
+## Updating
+
+```bash
+cd polyglot
+git pull
+./install.sh
+```
+
+`install.sh` is idempotent: it re-detects the hardware, re-syncs `.venv` (keeping the system ROCm `torch`/`torchaudio`/`triton` out of it), re-verifies acceleration, and rewrites the launcher. Restart `polyglot` afterwards.
+
+Do **not** run plain `uv sync` / `uv add` on a ROCm setup — both reinstall the CPU wheels and silently demote Polyglot to OpenVINO CPU. To confirm the environment at any time:
+
+```bash
+./install.sh --check --verify-model
+```
+
+That prints the detected stack, runs an FP16 matmul and a Triton kernel on the device, and loads Whisper through the app's own backend selection.
+
 ## Running
 
 ```bash
@@ -108,11 +128,29 @@ polyglot
 polyglot 2>>/tmp/polyglot.log
 ```
 
-Without the launcher:
+The launcher written by `install.sh` runs this checkout's `.venv`. Without it:
 
 ```bash
+.venv/bin/python app.py 2>>/tmp/polyglot.log
+# or, without re-syncing the venv:
 uv run --no-sync python app.py
 ```
+
+Application logs go to `/tmp/polyglot.log` regardless of redirection (configured in `app.py`); stdout/stderr carry only the TUI and native-library messages.
+
+## Configuration
+
+| Variable | Used by | Default |
+|----------|---------|---------|
+| `POLYGLOT_OLLAMA_URL` | Ollama engine | `http://localhost:11434` |
+| `POLYGLOT_OLLAMA_MODEL` | Default Ollama model (also added to the selector) | `aya-expanse:8b` |
+| `POLYGLOT_OPENAI_URL` | OpenAI-compatible engine, must include the version path | `http://localhost:11434/v1` |
+| `POLYGLOT_OPENAI_MODEL` | OpenAI-compatible engine | `mistral` |
+| `POLYGLOT_OPENAI_API_KEY` | Bearer token for hosted endpoints | empty |
+| `POLYGLOT_NLLB_MODEL` | NLLB engine default in the library API | `facebook/nllb-200-distilled-600M` |
+| `POLYGLOT_PYTHON` | `install.sh` base interpreter | `/usr/bin/python3.14` |
+
+Downloaded translation models live in the usual caches: Ollama's own store, Hugging Face (`~/.cache/huggingface/hub`) for NLLB, and argostranslate's package directory. Whisper weights use `~/.cache/whisper`.
 
 ## Key bindings
 
@@ -136,13 +174,14 @@ The **Translate** selector lists concrete models, not just engines. Missing mode
 | LibreTranslate | Self-hosted or Internet | Set URL in code |
 | Ollama | Local Ollama server | **Default.** `aya-expanse:8b` is pulled on demand after confirmation; also offers `qwen2.5:7b`, `gemma2:9b`. Override the list with `POLYGLOT_OLLAMA_MODEL`, server with `POLYGLOT_OLLAMA_URL` |
 | OpenAI-compatible | Local or hosted endpoint | `/chat/completions`: LM Studio, llama.cpp server, vLLM, OpenRouter, Groq. Configure with `POLYGLOT_OPENAI_URL`, `POLYGLOT_OPENAI_MODEL`, `POLYGLOT_OPENAI_API_KEY` |
-| NLLB-200 | None (offline) | 200 languages via `transformers`, runs on the GPU; model downloads on first use (`POLYGLOT_NLLB_MODEL`, default `facebook/nllb-200-distilled-600M`; use `facebook/nllb-200-distilled-1.3B` for better quality) |
+| NLLB-200 | None (offline) | 200 languages via `transformers`, runs on the GPU. Selector offers the 600M and 1.3B models; weights download on first use (`POLYGLOT_NLLB_MODEL` sets the library default) |
 | Argos | None (offline) | Downloads language packages on first use |
 
 ## Architecture
 
 ```
-AudioCapture (sounddevice)
+AudioCapture (PortAudio JACK client)
+    │ taps PipeWire sources; never opens a raw ALSA device
     │ float32 mono 16kHz chunks
     ▼
 Transcriber
