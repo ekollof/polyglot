@@ -28,6 +28,7 @@ import os
 import logging
 import queue
 import threading
+import time
 from typing import Optional
 
 from rich.text import Text
@@ -560,6 +561,12 @@ class PolyglotApp(App):
         self._model_name: str = "turbo"
         self._engine: str = ENGINE_OLLAMA
         self._engine_option: str = DEFAULT_ENGINE_OPTION
+        # Long-running background work (model loads, downloads, device waits)
+        # owns the status bar until it finishes; everything else falls back to
+        # the regular listening line.
+        self._activity: Optional[str] = None
+        self._activity_class = "status-loading"
+        self._activity_until = 0.0
         self._model_ready = False
 
         # Row tracking for in-place partial updates.
@@ -1081,14 +1088,14 @@ class PolyglotApp(App):
         # (network probe, argostranslate download).  Textual's call_from_thread
         # raises RuntimeError when called from the main thread, so branch on it.
         if threading.current_thread() is threading.main_thread():
-            self._set_status(message, "status-loading")
+            self._apply_translator_status(message)
         else:
-            self.call_from_thread(self._set_status, message, "status-loading")
+            self.call_from_thread(self._apply_translator_status, message)
 
     def _on_capture_status(self, message: str) -> None:
         """Called from the AudioCapture thread when the device state changes."""
         try:
-            self.call_from_thread(self._set_status, message)
+            self.call_from_thread(self._apply_capture_status, message)
         except Exception:
             pass  # app shutting down
 
@@ -1150,7 +1157,12 @@ class PolyglotApp(App):
 
     async def _select_engine(self, option: str, select: Select) -> None:
         engine, _, model = option.partition(":")
-        if not self._translator.is_model_available(engine, model):
+        # Availability is an HTTP/cache check; keep it off the event loop so
+        # a slow Ollama server cannot freeze the TUI.
+        available = await asyncio.to_thread(
+            self._translator.is_model_available, engine, model
+        )
+        if not available:
             if not await self._confirm_and_pull(engine, model, option):
                 select.value = self._engine_option
                 return
@@ -1164,12 +1176,18 @@ class PolyglotApp(App):
         )
         if not confirmed:
             return False
-        self._set_status(f"Downloading {model or engine}…", "status-loading")
+        self._set_activity(f"Downloading {model or engine}…")
         ok = await asyncio.to_thread(
             self._translator.pull_model, engine, model, self._pull_progress
         )
         if not ok:
-            self._set_status(f"Download failed: {model or engine}", "status-error")
+            self._set_activity(
+                f"Download failed: {model or engine}", "status-error", duration=8.0
+            )
+        else:
+            self._set_activity(
+                f"{model or engine} ready", "status-listening", duration=4.0
+            )
         return ok
 
     def _activate_engine(self, engine: str, model: str, option: str) -> None:
@@ -1183,11 +1201,13 @@ class PolyglotApp(App):
             self._translator.set_nllb_model(model)
         self._engine = engine
         self._engine_option = option
-        self._set_status(f"Translation: {model or engine}")
+        self._set_activity(
+            f"Translation: {model or engine}", "status-listening", duration=4.0
+        )
 
     def _pull_progress(self, message: str) -> None:
         try:
-            self.call_from_thread(self._set_status, message, "status-loading")
+            self.call_from_thread(self._set_activity, message)
         except Exception:
             pass  # app shutting down
 
@@ -1215,9 +1235,11 @@ class PolyglotApp(App):
         self._last_source_text = ""
         self._sentence_buffer.clear()
 
-    def action_focus_source(self) -> None:
+    async def action_focus_source(self) -> None:
         # PipeWire nodes and their indices churn, so rebuild before showing.
-        self._refresh_devices()
+        # PortAudio enumeration blocks; keep it off the event loop.
+        devices = await asyncio.to_thread(list_input_devices)
+        self._apply_devices(devices)
         self.query_one("#source-select").focus()
 
     def action_focus_target(self) -> None:
@@ -1234,6 +1256,15 @@ class PolyglotApp(App):
     # ------------------------------------------------------------------
 
     def _update_status(self) -> None:
+        # A background activity (model load, download, device wait) has
+        # priority over the listening line until it finishes or expires.
+        if self._activity is not None:
+            if self._activity_until and time.monotonic() >= self._activity_until:
+                self._activity = None
+            else:
+                self._set_status(self._activity, self._activity_class)
+                return
+
         if not self._model_ready:
             self._set_status(
                 f"● Loading Whisper model ({self._model_name})…", "status-loading"
@@ -1252,6 +1283,57 @@ class PolyglotApp(App):
             f" — {self._transcriber.backend_name if self._transcriber else 'CPU'}",
             "status-listening",
         )
+
+    def _set_activity(
+        self,
+        message: str,
+        css_class: str = "status-loading",
+        duration: Optional[float] = None,
+    ) -> None:
+        """Show background work in the status bar.
+
+        duration=None keeps the message until replaced or cleared; a value
+        expires it and falls back to the listening line.
+        """
+        self._activity = message
+        self._activity_class = css_class
+        self._activity_until = (
+            time.monotonic() + duration if duration is not None else 0.0
+        )
+        self._update_status()
+        if duration is not None:
+            try:
+                self.set_timer(duration + 0.05, self._update_status)
+            except Exception:
+                pass  # app shutting down
+
+    def _clear_activity(self) -> None:
+        if self._activity is None:
+            return
+        self._activity = None
+        self._update_status()
+
+    def _apply_translator_status(self, message: str) -> None:
+        """Classify engine messages: long operations persist, notes expire."""
+        lowered = message.lower()
+        if any(
+            word in lowered
+            for word in ("loading", "downloading", "pulling", "unloading", "releasing")
+        ):
+            self._set_activity(message)
+        elif "failed" in lowered or "unavailable" in lowered or "error" in lowered:
+            self._set_activity(message, "status-error", duration=8.0)
+        else:
+            self._set_activity(message, "status-listening", duration=4.0)
+
+    def _apply_capture_status(self, message: str) -> None:
+        lowered = message.lower()
+        if "waiting" in lowered:
+            self._set_activity(message, "status-loading")
+        elif "unavailable" in lowered:
+            self._set_activity(message, "status-error", duration=8.0)
+        else:
+            self._set_activity(message, "status-listening", duration=4.0)
 
     def _set_status(self, message: str, css_class: str = "status-listening") -> None:
         bar = self.query_one("#status-bar", Label)
@@ -1300,8 +1382,11 @@ class PolyglotApp(App):
         return next((d for d in self._devices if d["index"] == index), None)
 
     def _refresh_devices(self) -> None:
-        """Rebuild the source list; PipeWire nodes and indices churn constantly."""
-        self._devices = list_input_devices()
+        """Rebuild the source list; blocking, so callers use a thread."""
+        self._apply_devices(list_input_devices())
+
+    def _apply_devices(self, devices: list[dict]) -> None:
+        self._devices = devices
         try:
             select = self.query_one("#source-select", GroupedSelect)
         except Exception:

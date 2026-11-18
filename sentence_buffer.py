@@ -15,6 +15,48 @@ _TERMINAL = frozenset(".!?。！？؟۔।॥")
 _LEADING_ELLIPSIS = re.compile(r"^\s*(?:\.{2,}|…+)\s*")
 _TRAILING_ELLIPSIS = re.compile(r"(?:\.{2,}|…+)\s*$")
 
+# Generic cap for punctuation-free ASR output.  Whisper can return a long
+# block with no sentence punctuation, and holding it until the 2400-character
+# flush delays translation by many sentences.  No language-specific words are
+# involved: a run is cut at clause punctuation when available, otherwise at
+# the last space, and hard-cut at the limit for scripts that do not use spaces.
+_SOFT_LIMIT = 180
+_MIN_PIECE = 48
+_CLAUSE_BREAKS = ",;:，、；：،—–-"
+
+
+def _best_length_cut(text: str, limit: int = _SOFT_LIMIT) -> int:
+    """Cut position for an unpunctuated run, preferring a natural boundary."""
+    start = min(_MIN_PIECE, len(text) // 2)
+    best = -1
+    for character in _CLAUSE_BREAKS:
+        index = text.rfind(character, start, limit)
+        if index > best:
+            best = index
+    if best >= start:
+        return best + 1
+    space = text.rfind(" ", start, limit)
+    if space >= start:
+        return space + 1
+    return limit  # scripts without spaces
+
+
+def split_long_run(text: str):
+    """Split punctuation-free text into translation-sized pieces.
+
+    Returns (finished pieces, remainder).  The remainder is short enough to
+    wait for the next confirmed chunk.
+    """
+    pieces: list[str] = []
+    text = text.strip()
+    while len(text) > _SOFT_LIMIT:
+        cut = _best_length_cut(text)
+        piece = text[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        text = text[cut:].strip()
+    return pieces, text
+
 
 def join_fragments(left: str, right: str) -> str:
     """Remove only ellipses at the join, preserving internal punctuation."""
@@ -67,7 +109,12 @@ def completed_sentences(text: str):
         if sentence:
             sentences.append(sentence)
         start = index = end
-    return sentences, text[start:].strip()
+
+    pending = text[start:].strip()
+    if len(pending) > _SOFT_LIMIT:
+        extra, pending = split_long_run(pending)
+        sentences.extend(extra)
+    return sentences, pending
 
 
 @dataclass(frozen=True)

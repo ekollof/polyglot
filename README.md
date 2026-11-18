@@ -21,6 +21,7 @@ Listens to any audio source (applications, monitors, hardware inputs), transcrib
 - **Sentence-based translation** — unfinished text is joined across rolling audio chunks before translation, with completed sentences translated concurrently
 - **Multiple translation engines** — Ollama (default), NLLB-200, OpenAI-compatible endpoints, Google, MyMemory, LibreTranslate, Argos; missing models download on demand after a confirmation dialog
 - **Passive audio capture** — taps PipeWire sources (applications, monitors) through JACK; never opens a raw ALSA device, so other applications keep playing
+- **Live background status** — the status bar reports model loads, engine switches, model downloads and device reconnects; everything that can block runs off the UI thread
 - **Robust language ID** — detection runs on a rolling 5–30 s buffer of confirmed speech rather than raw 3 s VAD snapshots
 - **Script-mismatch suppression** — Latin-script partials are suppressed when the active language is Arabic/Persian-script and vice versa
 - **Speaker-change detection** — visual separator inserted when encoder embeddings differ between utterances
@@ -165,7 +166,7 @@ Downloaded translation models live in the usual caches: Ollama's own store, Hugg
 
 ## Translation engines
 
-The **Translate** selector lists concrete models, not just engines. Missing models are downloaded on demand after a confirmation dialog shows their size. Ollama is the default, so transcription works without sending text to a web service.
+The **Translate** selector lists concrete models, not just engines. Missing models are downloaded on demand after a confirmation dialog shows their size. Ollama is the default, so transcription works without sending text to a web service. Switching engines releases the previous local model: NLLB weights are dropped from VRAM and Ollama models are evicted immediately (`keep_alive: 0` — also when the OpenAI-compatible endpoint points at a local Ollama). Unloads run in the background, so the UI never waits on them.
 
 | Engine | Requires | Notes |
 |--------|----------|-------|
@@ -238,7 +239,7 @@ Utterances shorter than one second are held and merged with the next commit inst
 
 Rolling audio windows are processing boundaries, rather than sentence boundaries. Confirmed text ending in `...` or `…` is held and joined to the next confirmed chunk. Ellipses at the join are removed, while internal punctuation is retained. Abbreviations, decimals, closing quotes, and common non-Latin sentence punctuation are handled before a sentence is submitted for translation.
 
-An unfinished sentence remains visible as a dim italic source preview, with `…` in the translation pane. Live ASR partials are displayed alongside that confirmed tail but never sent to the translator. Sentence-ending punctuation submits the completed sentence immediately. A genuine silence reset, speaker/language change, model/source/target change, or engine change flushes any remaining confirmed text as an utterance; long punctuation-free text is also flushed at a 2,400-character threshold. Clear discards pending text.
+An unfinished sentence remains visible as a dim italic source preview, with `…` in the translation pane. Live ASR partials are displayed alongside that confirmed tail but never sent to the translator. Sentence-ending punctuation submits the completed sentence immediately. Punctuation-free runs are split generically once they pass 180 characters — at clause punctuation when present, otherwise at the last space, and hard-cut for scripts without spaces — so long unpunctuated Whisper blocks are translated in readable pieces instead of waiting for the 2,400-character flush. A genuine silence reset, speaker/language change, model/source/target change, or engine change flushes any remaining confirmed text as an utterance; the 2,400-character threshold remains as a final safety net. Clear discards pending text.
 
 Whisper can omit punctuation in Persian and other languages. Actual VAD utterance endings, and clearer pauses of at least 350 ms used for rolling cuts, therefore also release confirmed text after the matching transcript has been processed. Ordinary rolling cuts keep it pending. This provides punctuation-independent spoken boundaries without guessing Persian grammar, forcing a source language, or inventing full stops. An acoustic pause is still a cue, not proof of a grammatical sentence boundary.
 

@@ -145,7 +145,9 @@ class Translator:
         self._engine: str = engine
 
         # Online state (relevant only when engine is an online engine)
-        self._online: bool = _is_online()
+        # Assume online; the first failed request marks it offline, so startup
+        # never blocks on a DNS lookup in the UI thread.
+        self._online: bool = True
         self._last_probe: float = time.monotonic()
 
         # LibreTranslate config
@@ -201,30 +203,112 @@ class Translator:
         with self._lock:
             previous = self._engine
             self._engine = engine
-        if previous == ENGINE_NLLB and engine != ENGINE_NLLB:
-            self._release_nllb()
+        if previous != engine:
+            self._release_engine(previous)
         logger.info("Translation engine changed to '%s'.", engine)
         self._on_status(f"Translation engine: {engine}")
 
+    def _release_engine(self, engine: str) -> None:
+        """Free whatever *engine* had loaded locally.
+
+        Network unloads run on a daemon thread so a slow local server cannot
+        block the UI thread that switches engines.
+        """
+        if engine == ENGINE_NLLB:
+            self._on_status("Releasing NLLB model…")
+            self._release_nllb()
+        elif engine == ENGINE_OLLAMA:
+            model = self._ollama_model
+            self._on_status(f"Unloading Ollama model {model}…")
+            threading.Thread(
+                target=self._ollama_unload, args=(model,), daemon=True
+            ).start()
+        elif engine == ENGINE_OPENAI:
+            self._on_status("Releasing OpenAI-compatible model…")
+            threading.Thread(target=self._openai_unload, daemon=True).start()
+
+    def _ollama_unload(self, model: str) -> None:
+        """Ask Ollama to evict *model* now instead of after its idle timeout."""
+        if not model:
+            return
+        try:
+            import requests
+
+            requests.post(
+                f"{self._ollama_url}/api/generate",
+                json={"model": model, "keep_alive": 0},
+                timeout=5,
+            )
+            logger.info("Unloaded Ollama model %s", model)
+            self._on_status(f"Ollama model {model} unloaded")
+        except Exception as exc:
+            logger.debug("Ollama unload failed (%s): %s", model, exc)
+            self._on_status(f"Ollama unload failed: {model}")
+
+    def _openai_unload(self) -> None:
+        """Best effort: unload when the OpenAI endpoint is a local Ollama."""
+        base = self._openai_url
+        if not base.endswith("/v1"):
+            return
+        base = base[:-3]
+        if not any(
+            host in base for host in ("localhost", "127.0.0.1", "[::1]")
+        ):
+            return  # hosted providers have no unload endpoint
+        try:
+            import requests
+
+            requests.post(
+                f"{base}/api/generate",
+                json={"model": self._openai_model, "keep_alive": 0},
+                timeout=5,
+            )
+            logger.info("Unloaded OpenAI-compatible local model %s", self._openai_model)
+            self._on_status(f"{self._openai_model} unloaded")
+        except Exception as exc:
+            logger.debug("OpenAI-compatible unload failed: %s", exc)
+
     def _release_nllb(self) -> None:
-        """Free the NLLB model when another engine takes over."""
-        with self._nllb_lock:
+        """Free the NLLB model when another engine takes over.
+
+        Must never wait for the generation lock: an in-flight translation
+        holds it for the whole generate() call, and this runs on the UI
+        thread when the user switches engines.  The running call already
+        holds its own reference to the weights, so dropping the shared one
+        frees the VRAM as soon as it finishes.
+        """
+        if not self._nllb_lock.acquire(blocking=False):
+            self._nllb = None
+            logger.info("Released NLLB model (generation still running)")
+            self._on_status("NLLB model released")
+            return
+        try:
             if self._nllb is None:
                 return
             self._nllb = None
+        finally:
+            self._nllb_lock.release()
         try:
             import torch
 
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # empty_cache synchronises the device; never do that on the
+                # UI thread while Whisper may be decoding.
+                threading.Thread(target=torch.cuda.empty_cache, daemon=True).start()
         except Exception:
             pass
         logger.info("Released NLLB model")
+        self._on_status("NLLB model released")
 
     def set_ollama_model(self, model: str) -> None:
         """Switch the Ollama model used for translation.  Thread-safe."""
         with self._lock:
+            previous = self._ollama_model
             self._ollama_model = model
+        if previous and previous != model:
+            threading.Thread(
+                target=self._ollama_unload, args=(previous,), daemon=True
+            ).start()
         logger.info("Ollama model changed to '%s'.", model)
 
     def set_nllb_model(self, model: str) -> None:
@@ -232,8 +316,9 @@ class Translator:
         if model == self._nllb_model_name:
             return
         self._release_nllb()
-        with self._nllb_lock:
-            self._nllb_model_name = model
+        # Plain attribute write: acquiring _nllb_lock here would block the
+        # caller (the UI thread) behind an in-flight generation.
+        self._nllb_model_name = model
         logger.info("NLLB model changed to '%s'.", model)
 
     # ------------------------------------------------------------------

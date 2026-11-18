@@ -20,6 +20,31 @@ class SentenceBufferTests(unittest.TestCase):
         )
         self.assertEqual(buffer.pending, "Er is nog")
 
+    def test_long_unpunctuated_text_is_split_generically(self):
+        text = "word " * 60  # 300 characters, no sentence punctuation
+        complete, pending = completed_sentences(text)
+        self.assertTrue(complete)
+        self.assertTrue(all(len(piece) <= 180 for piece in complete))
+        self.assertLessEqual(len(pending), 180)
+
+    def test_clause_punctuation_is_preferred_for_the_cut(self):
+        text = "a" * 120 + ", " + "b" * 30 + " " + "c" * 100
+        complete, pending = completed_sentences(text)
+        self.assertTrue(complete)
+        self.assertTrue(complete[0].endswith(","))
+        self.assertLessEqual(len(pending), 180)
+
+    def test_script_without_spaces_is_hard_cut(self):
+        complete, pending = completed_sentences("漢" * 400)
+        self.assertTrue(complete)
+        self.assertTrue(all(len(piece) <= 180 for piece in complete))
+        self.assertLessEqual(len(pending), 180)
+
+    def test_short_unpunctuated_text_stays_pending(self):
+        complete, pending = completed_sentences("just a short tail")
+        self.assertEqual(complete, [])
+        self.assertEqual(pending, "just a short tail")
+
     def test_ellipsis_is_not_a_sentence_stop_even_before_a_capital(self):
         complete, pending = completed_sentences("I thought... Then I wondered…")
         self.assertEqual(complete, [])

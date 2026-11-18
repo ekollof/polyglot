@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from textual.widgets import RichLog, Select
+from textual.widgets import Label, RichLog, Select
 
 from app import (
     DEFAULT_ENGINE_OPTION,
@@ -240,6 +240,31 @@ class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
             app._translator.set_engine.assert_called_with(ENGINE_OLLAMA)
             app._translator.set_ollama_model.assert_called_once_with("qwen2.5:7b")
 
+    async def test_background_activity_owns_the_status_bar(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._model_ready = True
+            app._set_activity("Loading NLLB model test…")
+            app._show_partial(0, "live partial", "fa")
+            status = app.query_one("#status-bar", Label)
+            self.assertIn("Loading NLLB model test", str(status.render()))
+            app._clear_activity()
+            self.assertIn("Listening", str(status.render()))
+
+    async def test_translator_status_classification(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._apply_translator_status("Loading NLLB model facebook/nllb…")
+            self.assertEqual(app._activity, "Loading NLLB model facebook/nllb…")
+            app._apply_translator_status("Downloading offline package fa→en…")
+            self.assertEqual(app._activity, "Downloading offline package fa→en…")
+            app._apply_translator_status("Package download failed: timeout")
+            self.assertEqual(app._activity_class, "status-error")
+            app._apply_capture_status("Audio: waiting for Brave to return")
+            self.assertIn("waiting", app._activity)
+
     async def test_source_list_refreshes_before_it_is_opened(self):
         app = self.make_app()
         async with app.run_test(size=(140, 40)) as pilot:
@@ -250,7 +275,7 @@ class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
                     {"index": 3, "name": "New input", "group": "sound"},
                 ],
             ):
-                app.action_focus_source()
+                await app.action_focus_source()
             self.assertEqual([d["index"] for d in app._devices], [3])
             values = [value for _, value in app._device_options()]
             self.assertIn(3, values)

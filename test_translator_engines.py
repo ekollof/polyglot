@@ -1,5 +1,6 @@
 """OpenAI-compatible and NLLB engine wiring."""
 
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -133,6 +134,38 @@ class OllamaEngineTests(unittest.TestCase):
 
 
 class NLLBReleaseTests(unittest.TestCase):
+    def test_release_does_not_wait_for_an_in_flight_generation(self):
+        tr = make_translator(engine=ENGINE_NLLB)
+        tr._nllb = ("tokenizer", "model", "cuda")
+        tr._nllb_lock.acquire()  # simulate an in-flight generate()
+        try:
+            thread = threading.Thread(target=tr._release_nllb)
+            thread.start()
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive(), "release blocked on the lock")
+            self.assertIsNone(tr._nllb)
+        finally:
+            tr._nllb_lock.release()
+
+    def test_set_nllb_model_does_not_block_on_a_running_generation(self):
+        tr = make_translator(engine=ENGINE_NLLB)
+        tr._nllb = ("tokenizer", "model", "cuda")
+        tr._nllb_lock.acquire()
+        try:
+            thread = threading.Thread(
+                target=tr.set_nllb_model,
+                args=("facebook/nllb-200-distilled-1.3B",),
+            )
+            thread.start()
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive(), "model switch blocked on the lock")
+            self.assertIsNone(tr._nllb)
+            self.assertEqual(
+                tr._nllb_model_name, "facebook/nllb-200-distilled-1.3B"
+            )
+        finally:
+            tr._nllb_lock.release()
+
     def test_switching_away_releases_the_model(self):
         tr = make_translator(engine=ENGINE_NLLB)
         tr._nllb = ("tokenizer", "model", "cuda")
@@ -189,6 +222,67 @@ class ModelAvailabilityTests(unittest.TestCase):
         ) as argo:
             self.assertEqual(tr.translate("hello", "en", "fa"), "offline")
         argo.assert_called_once()
+
+
+class EngineReleaseTests(unittest.TestCase):
+    def test_ollama_unload_asks_for_immediate_eviction(self):
+        tr = make_translator(ollama_url="http://box:11434")
+        with patch("requests.post") as post:
+            tr._ollama_unload("aya-expanse:8b")
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], "http://box:11434/api/generate")
+        self.assertEqual(kwargs["json"], {"model": "aya-expanse:8b", "keep_alive": 0})
+
+    def test_switching_away_from_ollama_unloads_its_model(self):
+        tr = make_translator(engine=ENGINE_OLLAMA, ollama_model="aya-expanse:8b")
+        seen = []
+        done = threading.Event()
+
+        def fake_unload(model):
+            seen.append(model)
+            done.set()
+
+        with patch.object(tr, "_ollama_unload", side_effect=fake_unload):
+            tr.set_engine(ENGINE_ARGOS)
+        self.assertTrue(done.wait(1.0), "unload did not run")
+        self.assertEqual(seen, ["aya-expanse:8b"])
+
+    def test_changing_the_ollama_model_unloads_the_previous_one(self):
+        tr = make_translator(engine=ENGINE_OLLAMA, ollama_model="aya-expanse:8b")
+        seen = []
+        done = threading.Event()
+
+        def fake_unload(model):
+            seen.append(model)
+            done.set()
+
+        with patch.object(tr, "_ollama_unload", side_effect=fake_unload):
+            tr.set_ollama_model("qwen2.5:7b")
+        self.assertTrue(done.wait(1.0), "unload did not run")
+        self.assertEqual(seen, ["aya-expanse:8b"])
+        self.assertEqual(tr._ollama_model, "qwen2.5:7b")
+
+    def test_openai_unload_only_probes_a_local_ollama(self):
+        tr = make_translator(
+            openai_url="http://localhost:11434/v1", openai_model="aya-expanse:8b"
+        )
+        with patch("requests.post") as post:
+            tr._openai_unload()
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], "http://localhost:11434/api/generate")
+
+        hosted = make_translator(
+            openai_url="https://api.openai.com/v1", openai_model="gpt-4o-mini"
+        )
+        with patch("requests.post") as post:
+            hosted._openai_unload()
+        post.assert_not_called()
+
+    def test_switching_between_other_engines_keeps_nllb(self):
+        tr = make_translator(engine=ENGINE_GOOGLE)
+        tr._nllb = ("tokenizer", "model", "cuda")
+        tr.set_engine(ENGINE_ARGOS)
+        self.assertIsNotNone(tr._nllb)
 
 
 class LLMPromptTests(unittest.TestCase):
