@@ -24,8 +24,30 @@ dependencies = [
 [project.scripts]
 polyglot = "app:main"
 
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+# Flat layout: the application is a set of top-level modules, not a package.
+# Listing them explicitly keeps setuptools from guessing (and from pulling in
+# the test_*.py files or failing on multiple top-level modules).
+[tool.setuptools]
+py-modules = [
+    "app",
+    "audio",
+    "inference_backend",
+    "openvino_decoder",
+    "sentence_buffer",
+    "speech_quality",
+    "suppress_alsa",
+    "transcriber",
+    "translator",
+]
+
 # Keep PyTorch and its audio extension on matching CPU builds by default.
 # See https://docs.astral.sh/uv/guides/integration/pytorch/ for GPU indexes.
+# AMD users can reuse a distro ROCm PyTorch instead; see README.md,
+# "Using a distro ROCm PyTorch".
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }

@@ -827,14 +827,14 @@ wheels = [
 [[package]]
 name = "polyglot"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "argostranslate" },
     { name = "deep-translator" },
     { name = "lingua-language-detector" },
     { name = "numpy" },
     { name = "openai-whisper" },
-    { name = "openvino", marker = "(platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
+    { name = "openvino", marker = "(platform_machine == 'AMD64' or platform_machine == 'x86_64') and (sys_platform == 'linux' or sys_platform == 'win32')" },
     { name = "pulsectl" },
     { name = "rich" },
     { name = "scipy" },
@@ -855,7 +855,7 @@ requires-dist = [
     { name = "lingua-language-detector", specifier = ">=2.2.0" },
     { name = "numpy" },
     { name = "openai-whisper" },
-    { name = "openvino", marker = "(platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')", specifier = ">=2026.4.1" },
+    { name = "openvino", marker = "(platform_machine == 'AMD64' or platform_machine == 'x86_64') and (sys_platform == 'linux' or sys_platform == 'win32')", specifier = ">=2026.4.1" },
     { name = "pulsectl", specifier = ">=24.12.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "scipy" },
