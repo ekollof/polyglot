@@ -19,6 +19,7 @@ This file describes the project, conventions, and working rules for AI agents (O
 - OS: Linux (Arch), AMD ROCm GPU (~16 GB VRAM)
 - Python: 3.14, managed with `uv`
 - Venv: `.venv/` — always use `.venv/bin/python`
+- Venv is created with `--system-site-packages`: `torch`, `torchaudio`, and `triton` come from the Arch ROCm packages, not the CPU wheels. `./install.sh` sets this up; to re-sync manually use `uv sync --no-install-package torch --no-install-package torchaudio --no-install-package triton`
 - Run: `cd /home/andrath/Code/polyglot && .venv/bin/python app.py 2>>/tmp/polyglot.log`
 - Syntax check after every change: `.venv/bin/python -m py_compile <file>`
 

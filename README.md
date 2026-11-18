@@ -49,7 +49,7 @@ The status bar and `/tmp/polyglot.log` show the actual component placement and d
 
 The first OpenVINO load converts and compiles the supported components; this may take time, especially for larger models. Compiled models are cached in `$XDG_CACHE_HOME/polyglot/openvino` (normally `~/.cache/polyglot/openvino`). Start with `tiny` or `base` on Intel NPU/CPU; the default `turbo` model has a much larger encoder and can be slow to compile or decode.
 
-Installation uses CPU builds of PyTorch and torchaudio by default, including on Intel systems; OpenVINO is installed alongside them on Linux/Windows x86-64. CUDA/ROCm/XPU users must configure matching PyTorch and torchaudio sources for their driver using the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/), then run `uv sync`. Apple GPU detection uses [PyTorch MPS](https://docs.pytorch.org/docs/stable/notes/mps.html). Other vendor accelerators need a registered PyTorch extension capable of running Whisper. Runtime detection does not install or replace drivers or Python wheels.
+Installation uses CPU builds of PyTorch and torchaudio by default, including on Intel systems; OpenVINO is installed alongside them on Linux/Windows x86-64. CUDA/ROCm/XPU users must configure matching PyTorch and torchaudio sources for their driver using the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/), then run `uv sync`. AMD users on a distro that packages ROCm PyTorch can instead reuse those packages, as described under [Using a distro ROCm PyTorch](#using-a-distro-rocm-pytorch-amd). Apple GPU detection uses [PyTorch MPS](https://docs.pytorch.org/docs/stable/notes/mps.html). Other vendor accelerators need a registered PyTorch extension capable of running Whisper. Runtime detection does not install or replace drivers or Python wheels.
 
 NPU support follows the installed runtime: Intel NPUs use OpenVINO; vendor PyTorch NPUs are attempted and validated if registered. Apple Neural Engine/Core ML and Qualcomm QNN are not separate backends here. The inference selection layer is portable; the application's existing PulseAudio audio integration still requires Linux.
 
@@ -66,17 +66,52 @@ To check the devices OpenVINO can access as your normal user:
 ```bash
 git clone git@github.com:ekollof/polyglot.git
 cd polyglot
+./install.sh
+```
+
+`install.sh` detects the hardware and builds `.venv` for the best available backend: ROCm on AMD (reusing the distro's ROCm PyTorch packages), CUDA on NVIDIA, and the CPU/OpenVINO environment otherwise. It finishes by running an FP16 matmul and a Triton kernel on the selected device, so a broken accelerator stack fails at install time instead of silently demoting the app to OpenVINO CPU at runtime. A `polyglot` launcher is written to `~/.local/bin` that runs this checkout's `.venv`.
+
+| Option | Effect |
+|--------|--------|
+| `--device auto\|rocm\|cuda\|cpu` | Override detection |
+| `--check` | Report detection and verify the existing `.venv`, change nothing |
+| `--verify-model` | Also load the Whisper model through the app's own backend selection |
+| `--install-system` | Install missing system ROCm packages with pacman (Arch) |
+| `--model NAME` | Model used by `--verify-model` (default `turbo`) |
+| `--bin-dir DIR` | Where to write the `polyglot` launcher (default `~/.local/bin`) |
+| `--no-launcher` | Do not write the launcher |
+
+Without the script, `uv sync` builds the CPU/OpenVINO environment:
+
+```bash
 uv sync
 ```
 
 `uv sync` installs the Python dependencies, including Textual, NumPy, SciPy, Whisper, Silero VAD, and OpenVINO, into `.venv`. System Python packages and access to another user's model cache are not required. Install `ffmpeg`, PortAudio, and PulseAudio or PipeWire-Pulse using your distro's package manager.
 
+### Using a distro ROCm PyTorch (AMD)
+
+`./install.sh` selects this automatically on an AMD GPU. It relies on the Arch packages `python-pytorch-rocm`, `python-torchaudio-rocm`, and `python-triton`, which provide a ROCm build that matches the installed driver, and reuses them instead of downloading the CPU wheels:
+
+```bash
+uv venv --system-site-packages
+uv sync --no-install-package torch --no-install-package torchaudio --no-install-package triton
+```
+
+All three exclusions matter: the venv must not shadow the system `torch`, `torchaudio`, or `triton`. The locked `triton` is built for the CPU wheel and fails ROCm kernel compilation with `PassManager::run failed`, which makes Whisper's warmup fail and silently demotes the run to OpenVINO CPU. `uv sync` installs the excluded packages again unless the flags are repeated, and `uv run` syncs before running, so start the app with `uv run --no-sync python app.py` or `.venv/bin/python app.py`. The log then reports `Whisper model loaded — PyTorch ROCm` with FP16 enabled.
+
 ## Running
 
 ```bash
-uv run python app.py
+polyglot
 # or with debug logging:
-uv run python app.py 2>>/tmp/polyglot.log
+polyglot 2>>/tmp/polyglot.log
+```
+
+Without the launcher:
+
+```bash
+uv run --no-sync python app.py
 ```
 
 ## Key bindings
