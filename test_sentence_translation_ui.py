@@ -2,11 +2,17 @@
 
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from textual.widgets import RichLog, Select
 
-from app import PolyglotApp
+from app import (
+    DEFAULT_ENGINE_OPTION,
+    ConfirmDownload,
+    PolyglotApp,
+    TRANSLATION_ENGINES,
+)
+from translator import ENGINE_OLLAMA
 
 
 class SentenceApp(PolyglotApp):
@@ -15,14 +21,18 @@ class SentenceApp(PolyglotApp):
 
 
 class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unpunctuated_persian_waits_for_a_real_audio_boundary(self):
+    async def test_utterance_boundaries_keep_partial_sentences_pending(self):
         app = self.make_app()
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             app._accept_transcription("fa", "این‌ها می‌گویند که", 0.99)
             app._accept_transcription("fa", "باید یک دولت برای همه باشد", 0.99)
-            app._translation_worker.submit.assert_not_called()
+            # A VAD utterance end is a 600 ms pause, not a sentence end.
             await asyncio.to_thread(app._on_non_speech, "utterance_end")
+            app._translation_worker.submit.assert_not_called()
+            self.assertIn("باید یک دولت برای همه باشد", app._sentence_buffer.pending)
+            # Three seconds of silence is a real boundary.
+            await asyncio.to_thread(app._on_non_speech, "silence")
             app._translation_worker.submit.assert_called_once()
             job = app._translation_worker.submit.call_args.kwargs
             self.assertEqual(job["text"], "این‌ها می‌گویند که باید یک دولت برای همه باشد")
@@ -157,12 +167,100 @@ class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("SECOND", text)
             self.assertIn("THIRD", text)
 
+    async def test_missing_model_opens_the_confirmation_dialog(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._translator.is_model_available.return_value = False
+            select = app.query_one("#engine-select", Select)
+            previous = select.value
+            worker = app.run_worker(
+                app._select_engine("ollama:gemma2:9b", select),
+                group="engine-select",
+                exclusive=True,
+            )
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ConfirmDownload)
+            app.screen.dismiss(False)
+            await worker.wait()
+            self.assertEqual(select.value, previous)
+            app._translator.pull_model.assert_not_called()
+
+    async def test_confirmed_pull_then_activates_the_model(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._translator.is_model_available.return_value = False
+            app._translator.pull_model.return_value = True
+            select = app.query_one("#engine-select", Select)
+            with patch.object(app, "push_screen_wait", AsyncMock(return_value=True)):
+                await app._select_engine("ollama:gemma2:9b", select)
+            app._translator.pull_model.assert_called_once()
+            app._translator.set_ollama_model.assert_called_with("gemma2:9b")
+
+    async def test_cancelled_pull_reverts_the_selector(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._translator.is_model_available.return_value = False
+            select = app.query_one("#engine-select", Select)
+            previous = select.value
+            with patch.object(app, "push_screen_wait", AsyncMock(return_value=False)):
+                await app._select_engine("nllb:facebook/nllb-200-distilled-1.3B", select)
+            app._translator.pull_model.assert_not_called()
+            self.assertEqual(select.value, previous)
+
+    async def test_select_engine_activates_an_available_model(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await app._select_engine(
+                "ollama:qwen2.5:7b", app.query_one("#engine-select", Select)
+            )
+            app._translator.set_engine.assert_called_with(ENGINE_OLLAMA)
+            app._translator.set_ollama_model.assert_called_once_with("qwen2.5:7b")
+
+    async def test_engine_selector_lists_models_and_defaults_to_ollama(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            values = [value for _, value in TRANSLATION_ENGINES]
+            self.assertIn("ollama:aya-expanse:8b", values)
+            self.assertIn("ollama:qwen2.5:7b", values)
+            self.assertIn("nllb:facebook/nllb-200-distilled-1.3B", values)
+            self.assertEqual(
+                app.query_one("#engine-select", Select).value, DEFAULT_ENGINE_OPTION
+            )
+
+    async def test_activating_an_ollama_model_configures_the_translator(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._activate_engine(ENGINE_OLLAMA, "qwen2.5:7b", "ollama:qwen2.5:7b")
+            app._translator.set_engine.assert_called_with(ENGINE_OLLAMA)
+            app._translator.set_ollama_model.assert_called_once_with("qwen2.5:7b")
+
+    async def test_source_list_refreshes_before_it_is_opened(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            with patch(
+                "app.list_input_devices",
+                return_value=[
+                    {"index": 3, "name": "New input", "group": "sound"},
+                ],
+            ):
+                app.action_focus_source()
+            self.assertEqual([d["index"] for d in app._devices], [3])
+            values = [value for _, value in app._device_options()]
+            self.assertIn(3, values)
+
     async def test_target_switch_flushes_under_old_target_and_clear_drops_tail(self):
         app = self.make_app()
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             app._accept_transcription("nl", "Nog niet klaar", 0.9)
-            app.on_select_changed(
+            await app.on_select_changed(
                 Select.Changed(app.query_one("#lang-select", Select), "fr")
             )
             self.assertEqual(

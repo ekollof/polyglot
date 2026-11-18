@@ -15,7 +15,7 @@ import logging
 import queue
 import threading
 from math import gcd
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pulsectl
@@ -97,16 +97,44 @@ def _classify_device(name: str, source_classes: dict, app_names: set) -> str:
     return "sound"
 
 
+def _shared_hostapis() -> set[int]:
+    """Host APIs that tap PipeWire's graph without claiming the hardware.
+
+    A raw ALSA PCM (hw:, sysdefault, vdownmix, front, …) can be opened
+    exclusively and take the card away from every other application.  The
+    JACK host API connects a client to PipeWire's server instead, so capture
+    stays passive and other apps keep playing.
+    """
+    return {
+        index
+        for index, api in enumerate(sd.query_hostapis())
+        if "JACK" in str(api.get("name", ""))
+    }
+
+
 def list_input_devices() -> list[dict]:
     """Return usable input devices as a list of dicts with a 'group' field.
 
     group is one of: 'app' | 'monitor' | 'sound'
+
+    Only PipeWire-backed (JACK) devices are listed.  Polyglot must never lock
+    the audio bus: opening an ALSA PCM directly can steal the card from the
+    browser or any other player.  When no shared host API exists (no PipeWire),
+    the list falls back to whatever PortAudio offers.
     """
     source_classes = _pulse_source_classes()
     app_names = _pulse_app_names()
+    shared = _shared_hostapis()
+    if not shared:
+        logger.warning(
+            "No PipeWire/JACK host API found; falling back to ALSA devices, "
+            "which may hold the audio device exclusively"
+        )
     devices = []
     for i, info in enumerate(sd.query_devices()):
         if int(info["max_input_channels"]) < 1:
+            continue
+        if shared and int(info["hostapi"]) not in shared:
             continue
         name = info["name"]
         name_lower = name.lower()
@@ -159,6 +187,10 @@ def default_device(devices: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 
+class AudioDeviceLost(RuntimeError):
+    """The JACK/PipeWire node behind an open stream disappeared."""
+
+
 class AudioCapture:
     """
     Captures audio from a sounddevice input device in a background thread.
@@ -169,10 +201,25 @@ class AudioCapture:
     Supports hot-switching the source via `set_device(index)`.
     """
 
-    def __init__(self, device_index: int, audio_queue: Optional[queue.Queue] = None):
+    # Rates tried when a device rejects its advertised default (see
+    # _rate_candidates for why JACK devices need this).
+    _RATE_CANDIDATES = (44100, 48000, 88200, 96000, 176400, 192000)
+
+    # How often an open JACK/PipeWire stream checks that its node still exists.
+    _DEVICE_WATCH_S = 1.0
+
+    def __init__(
+        self,
+        device_index: int,
+        audio_queue: Optional[queue.Queue] = None,
+        device_name: str = "",
+        on_status: Optional[Callable[[str], None]] = None,
+    ):
         self.queue: queue.Queue[np.ndarray] = audio_queue or queue.Queue(maxsize=200)
         self._device_index = device_index
-        self._device_name: str = ""
+        self._device_name = device_name
+        self._on_status = on_status or (lambda message: None)
+        self._last_good_rate: int = 0
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._switch_event = threading.Event()
@@ -203,11 +250,17 @@ class AudioCapture:
             except KeyboardInterrupt, SystemExit:
                 pass
 
-    def set_device(self, device_index: int) -> None:
-        """Hot-switch to a different input device."""
+    def set_device(self, device_index: int, device_name: str = "") -> None:
+        """Hot-switch to a different input device.
+
+        The name pins the selection: device indices are not stable while
+        PipeWire nodes appear and disappear, so an index alone can silently
+        point at a different device by the time the stream reopens.
+        """
         with self._lock:
             self._device_index = device_index
-            self._device_name = ""  # will be resolved in _stream_device
+            self._device_name = device_name
+            self._last_good_rate = 0  # a different device may need another rate
         self._switch_event.set()
 
     # ------------------------------------------------------------------
@@ -215,6 +268,7 @@ class AudioCapture:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
+        failures = 0
         while not self._stop_event.is_set():
             with self._lock:
                 idx = self._device_index
@@ -222,18 +276,50 @@ class AudioCapture:
             self._switch_event.clear()
             try:
                 self._stream_device(idx)
+                failures = 0
+            except AudioDeviceLost as exc:
+                if self._stop_event.is_set():
+                    break
+                # The stream stayed open but its JACK/PipeWire node is gone, so
+                # reopen it under the new index once the node comes back.
+                with self._lock:
+                    lost = self._device_name or name
+                logger.info("%s; waiting for it to return", exc)
+                if lost:
+                    self._on_status(f"Audio: waiting for {lost} to return")
+                    self._reconnect_by_name(lost)
+                failures = 0
             except Exception as exc:
-                logger.warning(
-                    "AudioCapture error on device %d (%s): %s", idx, name, exc
-                )
-                # If the device has a known name (e.g. an app stream that
-                # de-registered), poll until it reappears under any index.
-                # For a user-requested switch (_switch_event already set) or
-                # a permanent device, fall back to a simple 1 s delay.
-                if name and not self._switch_event.is_set():
-                    self._reconnect_by_name(name)
-                else:
-                    self._stop_event.wait(1.0)
+                if self._stop_event.is_set():
+                    break
+                failures += 1
+                with self._lock:
+                    current = self._device_name or name
+                # Only the first failure of a streak warns; a device that
+                # stays broken must not flood the log.
+                log = logger.warning if failures == 1 else logger.debug
+                log("AudioCapture error on device %d (%s): %s", idx, current, exc)
+                if failures == 1 and current:
+                    self._on_status(f"Audio: {current} unavailable — retrying")
+                # Reconnecting only makes sense when the device is really gone.
+                if (
+                    current
+                    and not self._switch_event.is_set()
+                    and not self._device_present(current)
+                ):
+                    self._reconnect_by_name(current)
+                # Back off so a permanently failing device cannot spin.
+                self._stop_event.wait(min(5.0, float(failures)))
+
+    @staticmethod
+    def _device_present(name: str) -> bool:
+        try:
+            return any(
+                info["name"] == name and int(info["max_input_channels"]) > 0
+                for info in sd.query_devices()
+            )
+        except Exception:
+            return False
 
     def _reconnect_by_name(self, name: str) -> None:
         """Block until a device with *name* reappears, then update _device_index."""
@@ -249,33 +335,108 @@ class AudioCapture:
                             name,
                             i,
                         )
+                        self._on_status(f"Audio: reconnected to {name}")
                         return
             except Exception as exc:
                 logger.debug("query_devices error while waiting: %s", exc)
             self._stop_event.wait(1.0)
 
+    def _rate_candidates(self, default_rate: int) -> list[int]:
+        """Rates to try, advertised default and last known good first.
+
+        PortAudio reports a JACK device's hardware rate, but the JACK graph
+        runs at the server rate (PipeWire is often at 44100 while the USB
+        interface advertises 48000), so the first open fails with
+        PaErrorCode -9997 and the real rate has to be discovered.
+        """
+        ordered: list[int] = []
+        for rate in (default_rate, self._last_good_rate, *self._RATE_CANDIDATES):
+            if rate > 0 and rate not in ordered:
+                ordered.append(rate)
+        return ordered
+
+    @staticmethod
+    def _is_rate_error(exc: Exception) -> bool:
+        text = str(exc)
+        return "Invalid sample rate" in text or "PaErrorCode -9997" in text
+
+    @staticmethod
+    def _locate_device(device_index: int, name: str) -> Optional[int]:
+        """Index of the named input device, or None when it is gone.
+
+        JACK/PipeWire app nodes shift index whenever any other node appears or
+        disappears, so a moved index is not a lost device.
+        """
+        try:
+            info = sd.query_devices(device_index)
+            if info["name"] == name and int(info["max_input_channels"]) > 0:
+                return device_index
+        except Exception:
+            pass
+        try:
+            for index, info in enumerate(sd.query_devices()):
+                if info["name"] == name and int(info["max_input_channels"]) > 0:
+                    return index
+        except Exception:
+            pass
+        return None
+
     def _stream_device(self, device_index: int) -> None:
         info = sd.query_devices(device_index)
-        native_rate = int(info["default_samplerate"])
+        with self._lock:
+            expected = self._device_name
+        if expected and info["name"] != expected:
+            # The index now names another device.  Follow the selected name
+            # instead of capturing whatever moved into its old slot.
+            located = self._locate_device(device_index, expected)
+            if located is None:
+                raise AudioDeviceLost(
+                    f"Device {device_index} ({expected}) disappeared"
+                )
+            logger.info(
+                "Device '%s' moved from index %d to %d", expected, device_index, located
+            )
+            device_index = located
+            info = sd.query_devices(device_index)
+        name = info["name"]
         native_channels = min(int(info["max_input_channels"]), 2)
+        # JACK/PipeWire app nodes disappear while the app is paused; PortAudio
+        # keeps such a stream open and silently delivers zeros, so watch them.
+        hostapi = int(info["hostapi"])
+        watch_node = "JACK" in sd.query_hostapis(hostapi)["name"]
 
         # Record the name so _run() can reconnect by name if the device drops.
         with self._lock:
-            self._device_name = info["name"]
+            self._device_name = name
 
+        last_error: Optional[Exception] = None
+        for rate in self._rate_candidates(int(info["default_samplerate"])):
+            try:
+                self._stream_until_switched(
+                    device_index, name, rate, native_channels, watch_node
+                )
+                self._last_good_rate = rate
+                return
+            except sd.PortAudioError as exc:
+                if not self._is_rate_error(exc):
+                    raise
+                last_error = exc
+                logger.debug("Device %d (%s) rejected %d Hz", device_index, name, rate)
+        raise last_error or RuntimeError("no usable sample rate")
+
+    def _stream_until_switched(
+        self,
+        device_index: int,
+        name: str,
+        native_rate: int,
+        native_channels: int,
+        watch_node: bool = False,
+    ) -> None:
         # Compute resample ratio once.
         g = gcd(WHISPER_RATE, native_rate)
         up = WHISPER_RATE // g
         down = native_rate // g
         need_resample = native_rate != WHISPER_RATE
-
-        logger.info(
-            "Opened device %d (%s) — %d Hz, %d ch",
-            device_index,
-            info["name"],
-            native_rate,
-            native_channels,
-        )
 
         def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             if status:
@@ -310,5 +471,29 @@ class AudioCapture:
             blocksize=CHUNK_FRAMES,
             callback=callback,
         ):
-            # Block until stop or device switch.
-            self._switch_event.wait()
+            # Log only after PortAudio accepted the stream, so a rejected
+            # sample rate is never reported as an open device.
+            logger.info(
+                "Opened device %d (%s) — %d Hz, %d ch",
+                device_index,
+                name,
+                native_rate,
+                native_channels,
+            )
+            # Block until stop or device switch, checking that a JACK/PipeWire
+            # node has not disappeared underneath the still-open stream.
+            while not self._switch_event.wait(self._DEVICE_WATCH_S):
+                if not watch_node:
+                    continue
+                located = self._locate_device(device_index, name)
+                if located is None:
+                    raise AudioDeviceLost(
+                        f"Device {device_index} ({name}) disappeared"
+                    )
+                if located != device_index:
+                    logger.debug(
+                        "Device %d (%s) moved to index %d", device_index, name, located
+                    )
+                    device_index = located
+                    with self._lock:
+                        self._device_index = located

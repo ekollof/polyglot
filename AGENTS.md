@@ -11,7 +11,7 @@ This file describes the project, conventions, and working rules for AI agents (O
 - Transcription by openai-whisper (GPU, ROCm AMD)
 - Language detection: Whisper `detect_language` + SpeechBrain VoxLingua107, fused
 - Text language cross-check: Lingua
-- Translation: deep-translator (Google/MyMemory), LibreTranslate, Ollama, argostranslate
+- Translation: deep-translator (Google/MyMemory), LibreTranslate, Ollama (default), OpenAI-compatible endpoints, NLLB-200, argostranslate. The selector lists concrete models and downloads missing ones after a confirmation dialog
 - UI: Textual TUI
 
 ## Environment
@@ -19,7 +19,7 @@ This file describes the project, conventions, and working rules for AI agents (O
 - OS: Linux (Arch), AMD ROCm GPU (~16 GB VRAM)
 - Python: 3.14, managed with `uv`
 - Venv: `.venv/` — always use `.venv/bin/python`
-- Venv is created with `--system-site-packages`: `torch`, `torchaudio`, and `triton` come from the Arch ROCm packages, not the CPU wheels. `./install.sh` sets this up; to re-sync manually use `uv sync --no-install-package torch --no-install-package torchaudio --no-install-package triton`
+- Venv is created with `--system-site-packages`: `torch`, `torchaudio`, and `triton` come from the Arch ROCm packages, not the CPU wheels. `./install.sh` sets this up; to re-sync manually use `uv sync --no-install-package torch --no-install-package torchaudio --no-install-package triton`. `uv add` also runs a sync, so use those flags (or re-run `./install.sh`) after changing dependencies
 - Run: `cd /home/andrath/Code/polyglot && .venv/bin/python app.py 2>>/tmp/polyglot.log`
 - Syntax check after every change: `.venv/bin/python -m py_compile <file>`
 
@@ -42,6 +42,10 @@ This file describes the project, conventions, and working rules for AI agents (O
 - **TranslationWorker**: `ThreadPoolExecutor` (4 workers) — translations run concurrently.
 - **Textual main thread**: UI only. Cross-thread calls use `call_from_thread`.
 
+### Audio capture
+- **Never open a raw ALSA PCM** (`hw:`, `sysdefault`, `vdownmix`, `front`, …). Those can claim the card exclusively and mute every other application. `list_input_devices()` lists only PipeWire-backed JACK sources, so capture is a passive tap on PipeWire's graph.
+- Device selection is pinned by **name**, not index: PipeWire nodes appear/disappear and PortAudio renumbers them, so `set_device(index, name)` follows the name and waits when it vanishes.
+
 ### No locking
 Do not introduce `threading.Lock`, semaphores, or any explicit synchronisation. The design is intentionally lockless:
 - `_infer_queue` is the only cross-thread channel between VAD and Inference
@@ -57,6 +61,7 @@ Do not introduce `threading.Lock`, semaphores, or any explicit synchronisation. 
 
 ### Translation pane
 - Each committed utterance gets a pre-allocated slot in `_trans_slots` (row_id → line index)
+- `SentenceBuffer` joins unpunctated commits; it flushes to the translator only on `silence` (3 s), speaker change, language change, device/model/engine switch, or `inference_error` — **never on `utterance_end`**, which is a 600 ms phrase pause and would translate half sentences
 - `_update_translation_row` does a keyed slot lookup — order of arrival doesn't matter
 - Translations arriving before their slot is registered are stashed in `_pending_trans`
 - **Never** submit partial translations to `TranslationWorker` (causes slot/strip races)
@@ -66,7 +71,7 @@ Do not introduce `threading.Lock`, semaphores, or any explicit synchronisation. 
 - Always read `/tmp/polyglot.log` before diagnosing issues
 - Syntax-check with `.venv/bin/python -m py_compile` after every edit
 - LSP/pyright type annotation warnings are cosmetic — do not fix them unless asked
-- Do not pin source language — keep auto-detection
+- Do not pin source language — keep auto-detection. Commits may decode with the *detected* language as a hint (`_commit_language_hint`), but never force a configured language, and `_decode_commit` must keep its auto-detect fallback when the hinted decode scores worse
 - Partials display as dim italic in the source pane; the translation pane shows `…` until the utterance is committed
 - GPU is ROCm (AMD) — avoid CUDA-specific assumptions
 

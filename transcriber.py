@@ -183,6 +183,14 @@ _NOISE_TOKEN_RE = _re.compile(
 # lingering when subsequent detections keep falling below the confidence bar.
 LANG_STALE_SECONDS: float = 30.0
 
+# Confidence required before the rolling language detection is used as a
+# per-commit decoding hint.  Below this, Whisper auto-detects as before.
+COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE: float = 0.8
+
+# Quality below which a hinted decode is compared against auto-detection, so
+# a stale hint (speaker switch, music) cannot force the wrong language.
+COMMIT_LANGUAGE_RETRY_QUALITY: float = -0.65
+
 
 def _is_noise_token(text: str) -> bool:
     """Return True if *text* consists entirely of Whisper noise/music tokens."""
@@ -1021,10 +1029,32 @@ class Transcriber:
             total += weight
         return weighted / total if total else float("-inf")
 
-    def _decode_commit(self, model, audio):
+    def _commit_language_hint(self, captured_at) -> Optional[str]:
+        """Language to decode the commit in, or None to auto-detect.
+
+        Whisper's per-utterance detection is unreliable on 1–2 s VAD commits:
+        Persian speech decodes as Turkish, English, or French, and the
+        confidence filter then drops it. The rolling detection already knows
+        the language from ~5 s of confirmed speech, so use it as a hint.
+        _decode_commit falls back to auto-detection when the hint scores
+        worse, so a speaker switch is still handled.
+        """
+        confidence = self._detected_confidence or 0.0
+        if self._detected_lang and confidence >= COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE:
+            return self._detected_lang
+        evidence = self._speechbrain_evidence(
+            captured_at if captured_at is not None else time.monotonic()
+        )
+        if evidence and evidence.probabilities:
+            top = max(evidence.probabilities, key=evidence.probabilities.get)
+            if evidence.probabilities[top] >= COMMIT_LANGUAGE_HINT_MIN_CONFIDENCE:
+                return top
+        return None
+
+    def _decode_commit(self, model, audio, language: Optional[str] = None):
         options = dict(
             task="transcribe",
-            language=None,
+            language=language,
             fp16=self._fp16,
             temperature=0.0,
             beam_size=1,
@@ -1039,9 +1069,29 @@ class Transcriber:
         result = model.transcribe(audio, **options)
         elapsed = time.monotonic() - started
         quality = self._transcription_quality(result)
+
+        # A hint from an older utterance, music, or a speaker switch decodes
+        # worse than auto-detection. Compare before spending a beam retry.
+        if language is not None and self._quality_retry_allowed:
+            text = str(result.get("text", ""))
+            if quality < COMMIT_LANGUAGE_RETRY_QUALITY or _partial_script_mismatch(
+                text, language
+            ):
+                auto_options = dict(options, language=None)
+                candidate = model.transcribe(audio, **auto_options)
+                candidate_quality = self._transcription_quality(candidate)
+                if candidate_quality > quality + 0.05:
+                    logger.debug(
+                        "Auto-detect beat the %s hint (%.2f > %.2f)",
+                        language,
+                        candidate_quality,
+                        quality,
+                    )
+                    result, quality, options = candidate, candidate_quality, auto_options
+
         if (
             self._quality_retry_allowed
-            and elapsed <= len(audio) / WHISPER_RATE * 0.2
+            and elapsed <= len(audio) / WHISPER_RATE * 0.35
             and len(audio) >= int(1.5 * WHISPER_RATE)
             and -1.5 <= quality < -0.65
         ):
@@ -1107,15 +1157,15 @@ class Transcriber:
         if lang is None:
             lang = self._detected_lang
 
-        # Never force the language on commits.  With task="transcribe" and
-        # language=None, Whisper auto-detects the language per commit window
-        # and transcribes in that language — it does NOT translate.  Forcing
-        # language="en" on audio that contains Arabic/Farsi words causes
-        # Whisper to either translate semantically (fluent English output that
-        # is actually a translation) or produce low-logprob phonetic garbage
-        # that our filter then drops.  Both outcomes are worse than letting
-        # Whisper pick the language itself from the actual audio.
-        logger.debug("Commit: using Whisper auto-detect (lang hint=%s)", lang)
+        # The rolling detector knows the language from several seconds of
+        # confirmed speech, and short granular commits (~2 s) are exactly where
+        # Whisper's own detection fails: Persian speech was decoded as Turkish,
+        # English, or French and then dropped as low-confidence.  The hint is
+        # therefore taken from live detection, never from configuration, and
+        # _decode_commit reverts to auto-detection whenever the hinted decode
+        # scores worse.  A hard pin (language="en" on Persian audio) would
+        # translate instead of transcribe, which this avoids.
+        logger.debug("Commit: language hint=%s (auto-detect fallback on)", lang)
 
         # Never pass initial_prompt to commits.  With multilingual audio the
         # prompt is often in the wrong language (e.g. Arabic after a single
@@ -1134,7 +1184,10 @@ class Transcriber:
 
         try:
             t0 = time.monotonic()
-            source_result = self._decode_commit(model, audio)
+            hint = self._commit_language_hint(captured_at)
+            if hint:
+                logger.debug("Commit: decoding with detected language %s", hint)
+            source_result = self._decode_commit(model, audio, language=hint)
 
             detected_lang: str = str(source_result.get("language") or "?")
             self._last_transcribed_lang = detected_lang

@@ -22,7 +22,9 @@ from suppress_alsa import prewarm_tqdm_lock
 
 prewarm_tqdm_lock()
 
+import asyncio
 import concurrent.futures
+import os
 import logging
 import queue
 import threading
@@ -33,6 +35,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     Footer,
@@ -53,7 +56,9 @@ from translator import (
     ENGINE_GOOGLE,
     ENGINE_LIBRETRANSLATE,
     ENGINE_MYMEMORY,
+    ENGINE_NLLB,
     ENGINE_OLLAMA,
+    ENGINE_OPENAI,
     Translator,
 )
 
@@ -187,14 +192,44 @@ TARGET_LANGUAGES: list[tuple[str, str]] = sorted(
     LANGUAGE_NAMES.items(), key=lambda x: x[1]
 )  # sorted by display name
 
-# Translation engines available in the UI.
+# Translation engines available in the UI.  Composite values carry the model
+# for engines that can host several; selecting a missing model offers to
+# download it before switching.
+OLLAMA_MODELS = [
+    ("aya-expanse:8b", "5.1 GB"),
+    ("qwen2.5:7b", "4.7 GB"),
+    ("gemma2:9b", "5.4 GB"),
+]
+# POLYGLOT_OLLAMA_MODEL lets a user keep a different local model; show it too.
+_OLLAMA_DEFAULT = os.environ.get("POLYGLOT_OLLAMA_MODEL", OLLAMA_MODELS[0][0])
+_OLLAMA_OPTIONS = list(OLLAMA_MODELS)
+if _OLLAMA_DEFAULT not in {model for model, _ in OLLAMA_MODELS}:
+    _OLLAMA_OPTIONS.insert(0, (_OLLAMA_DEFAULT, ""))
+NLLB_MODELS = [
+    ("facebook/nllb-200-distilled-600M", "1.2 GB"),
+    ("facebook/nllb-200-distilled-1.3B", "2.7 GB"),
+]
+
 TRANSLATION_ENGINES: list[tuple[str, str]] = [
-    ("Google", ENGINE_GOOGLE),
-    ("MyMemory", ENGINE_MYMEMORY),
+    ("Google (internet)", ENGINE_GOOGLE),
+    ("MyMemory (internet)", ENGINE_MYMEMORY),
     ("LibreTranslate", ENGINE_LIBRETRANSLATE),
-    ("Ollama (local)", ENGINE_OLLAMA),
+    *[
+        (
+            f"Ollama · {model}" + (f" ({size})" if size else ""),
+            f"{ENGINE_OLLAMA}:{model}",
+        )
+        for model, size in _OLLAMA_OPTIONS
+    ],
+    ("OpenAI-compatible (configured)", ENGINE_OPENAI),
+    *[
+        (f"NLLB-200 · {model.rsplit('/', 1)[-1]} ({size})", f"{ENGINE_NLLB}:{model}")
+        for model, size in NLLB_MODELS
+    ],
     ("Argos (offline)", ENGINE_ARGOS),
 ]
+
+DEFAULT_ENGINE_OPTION = f"{ENGINE_OLLAMA}:{_OLLAMA_DEFAULT}"
 
 # Whisper models in order from fastest/smallest to slowest/largest.
 # Model      Params   VRAM    Relative speed   Notes
@@ -360,6 +395,36 @@ RichLog {
 #status-bar.status-error {
     color: $error;
 }
+
+ConfirmDownload {
+    align: center middle;
+}
+
+#confirm-dialog {
+    width: 64;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#confirm-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#confirm-detail {
+    margin-bottom: 1;
+}
+
+#confirm-buttons {
+    height: auto;
+    align: right middle;
+}
+
+#confirm-buttons Button {
+    margin-left: 1;
+}
 """
 
 
@@ -431,6 +496,37 @@ class TranslationWorker:
 # ---------------------------------------------------------------------------
 
 
+class ConfirmDownload(ModalScreen[bool]):
+    """Confirm an on-demand model download before it starts."""
+
+    BINDINGS = [Binding("escape", "dismiss_false", "Cancel")]
+
+    def __init__(self, model: str, size: str) -> None:
+        super().__init__()
+        self._model = model
+        self._size_label = size
+
+    def compose(self) -> ComposeResult:
+        detail = self._model
+        if self._size_label:
+            detail += f"  ({self._size_label})"
+        with Vertical(id="confirm-dialog"):
+            yield Static("Download translation model?", id="confirm-title")
+            yield Static(
+                f"{detail}\n\nIt will be stored locally and used for translation.",
+                id="confirm-detail",
+            )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Download", variant="primary", id="confirm-yes")
+                yield Button("Cancel", id="confirm-no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-yes")
+
+    def action_dismiss_false(self) -> None:
+        self.dismiss(False)
+
+
 class PolyglotApp(App):
     """Real-time multilingual transcription and translation."""
 
@@ -453,13 +549,17 @@ class PolyglotApp(App):
         self._audio_queue: queue.Queue = queue.Queue(maxsize=300)
         self._capture: Optional[AudioCapture] = None
         self._transcriber: Optional[Transcriber] = None
-        self._translator = Translator(on_status=self._on_translator_status)
+        self._translator = Translator(
+            engine=ENGINE_OLLAMA,
+            on_status=self._on_translator_status,
+        )
         self._translation_worker: Optional[TranslationWorker] = None
         self._current_device_index: int = default_device(self._devices)
         self._target_lang: str = "en"
         self._detected_lang: str = "?"
         self._model_name: str = "turbo"
-        self._engine: str = ENGINE_GOOGLE
+        self._engine: str = ENGINE_OLLAMA
+        self._engine_option: str = DEFAULT_ENGINE_OPTION
         self._model_ready = False
 
         # Row tracking for in-place partial updates.
@@ -537,7 +637,7 @@ class PolyglotApp(App):
                 yield Label("  Translate:", classes="control-label")
                 yield Select(
                     options=[(label, key) for label, key in TRANSLATION_ENGINES],
-                    value=ENGINE_GOOGLE,
+                    value=DEFAULT_ENGINE_OPTION,
                     id="engine-select",
                 )
                 yield Button("Clear", id="clear-btn", variant="default")
@@ -553,6 +653,29 @@ class PolyglotApp(App):
 
     def on_mount(self) -> None:
         self._start_pipeline()
+        self._check_default_model()
+
+    @work(exclusive=True)
+    async def _check_default_model(self) -> None:
+        """Offer to fetch the default translation model on first run."""
+        engine, _, model = self._engine_option.partition(":")
+        if engine == ENGINE_OLLAMA:
+            names = await asyncio.to_thread(self._translator.ollama_models)
+            if not isinstance(names, (set, frozenset)):
+                if names is None:
+                    self._set_status(
+                        "Ollama unreachable — using offline fallback", "status-error"
+                    )
+                return
+            installed = model in names or f"{model}:latest" in names
+        elif engine == ENGINE_NLLB:
+            installed = self._translator.is_model_available(engine, model)
+        else:
+            return
+        if installed:
+            return
+        if await self._confirm_and_pull(engine, model, self._engine_option):
+            self._set_status(f"{model} ready")
 
     def on_unmount(self) -> None:
         if self._transcriber:
@@ -575,9 +698,12 @@ class PolyglotApp(App):
         )
 
         # Audio capture
+        current = self._device_entry(self._current_device_index)
         self._capture = AudioCapture(
             device_index=self._current_device_index,
             audio_queue=self._audio_queue,
+            device_name=current["name"] if current else "",
+            on_status=self._on_capture_status,
         )
         self._capture.start()
 
@@ -692,7 +818,11 @@ class PolyglotApp(App):
     def _on_non_speech(self, reason: str) -> None:
         """Handle rejected audio and ordered acoustic utterance boundaries."""
         logger.debug("Transcription boundary/status: %s", reason)
-        if reason in ("silence", "utterance_end", "inference_error"):
+        # VAD utterance ends are 600 ms phrase pauses, so flushing there
+        # submits half sentences to the translator.  sentence_buffer.pending
+        # holds unfinished text and joins it with the next commit; only a
+        # 3 s silence (or a failure) means the speaker really stopped.
+        if reason in ("silence", "inference_error"):
             self.call_from_thread(self._flush_sentence_buffer)
 
     # ------------------------------------------------------------------
@@ -955,11 +1085,18 @@ class PolyglotApp(App):
         else:
             self.call_from_thread(self._set_status, message, "status-loading")
 
+    def _on_capture_status(self, message: str) -> None:
+        """Called from the AudioCapture thread when the device state changes."""
+        try:
+            self.call_from_thread(self._set_status, message)
+        except Exception:
+            pass  # app shutting down
+
     # ------------------------------------------------------------------
     # Widget event handlers
     # ------------------------------------------------------------------
 
-    def on_select_changed(self, event: Select.Changed) -> None:
+    async def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "source-select":
             if event.value is Select.BLANK:
                 return
@@ -971,7 +1108,8 @@ class PolyglotApp(App):
                 self._flush_sentence_buffer()
             self._current_device_index = new_idx
             if self._capture:
-                self._capture.set_device(new_idx)
+                entry = self._device_entry(new_idx)
+                self._capture.set_device(new_idx, entry["name"] if entry else "")
             self._update_status()
 
         elif event.select.id == "lang-select":
@@ -995,15 +1133,71 @@ class PolyglotApp(App):
         elif event.select.id == "engine-select":
             if event.value is Select.BLANK:
                 return
-            new_engine = str(event.value)
-            if new_engine != self._engine:
-                self._flush_sentence_buffer()
-                self._engine = new_engine
-                self._translator.set_engine(new_engine)
+            # push_screen_wait requires a worker context.
+            self.run_worker(
+                self._select_engine(str(event.value), event.select),
+                group="engine-select",
+                exclusive=True,
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "clear-btn":
             self.action_clear()
+
+    # ------------------------------------------------------------------
+    # Translation engine selection
+    # ------------------------------------------------------------------
+
+    async def _select_engine(self, option: str, select: Select) -> None:
+        engine, _, model = option.partition(":")
+        if not self._translator.is_model_available(engine, model):
+            if not await self._confirm_and_pull(engine, model, option):
+                select.value = self._engine_option
+                return
+        self._activate_engine(engine, model, option)
+
+    async def _confirm_and_pull(
+        self, engine: str, model: str, option: str
+    ) -> bool:
+        confirmed = await self.push_screen_wait(
+            ConfirmDownload(model or engine, self._engine_size(option))
+        )
+        if not confirmed:
+            return False
+        self._set_status(f"Downloading {model or engine}…", "status-loading")
+        ok = await asyncio.to_thread(
+            self._translator.pull_model, engine, model, self._pull_progress
+        )
+        if not ok:
+            self._set_status(f"Download failed: {model or engine}", "status-error")
+        return ok
+
+    def _activate_engine(self, engine: str, model: str, option: str) -> None:
+        if option == self._engine_option:
+            return
+        self._flush_sentence_buffer()
+        self._translator.set_engine(engine)
+        if engine == ENGINE_OLLAMA and model:
+            self._translator.set_ollama_model(model)
+        if engine == ENGINE_NLLB and model:
+            self._translator.set_nllb_model(model)
+        self._engine = engine
+        self._engine_option = option
+        self._set_status(f"Translation: {model or engine}")
+
+    def _pull_progress(self, message: str) -> None:
+        try:
+            self.call_from_thread(self._set_status, message, "status-loading")
+        except Exception:
+            pass  # app shutting down
+
+    def _engine_size(self, option: str) -> str:
+        for label, value in TRANSLATION_ENGINES:
+            if value == option:
+                start = label.rfind("(")
+                if start != -1 and label.endswith(")"):
+                    return label[start + 1 : -1]
+        return ""
 
     # ------------------------------------------------------------------
     # Actions
@@ -1022,6 +1216,8 @@ class PolyglotApp(App):
         self._sentence_buffer.clear()
 
     def action_focus_source(self) -> None:
+        # PipeWire nodes and their indices churn, so rebuild before showing.
+        self._refresh_devices()
         self.query_one("#source-select").focus()
 
     def action_focus_target(self) -> None:
@@ -1099,6 +1295,20 @@ class PolyglotApp(App):
                 name = d["name"]
                 return name[:30] + "…" if len(name) > 30 else name
         return f"device {index}"
+
+    def _device_entry(self, index: int) -> Optional[dict]:
+        return next((d for d in self._devices if d["index"] == index), None)
+
+    def _refresh_devices(self) -> None:
+        """Rebuild the source list; PipeWire nodes and indices churn constantly."""
+        self._devices = list_input_devices()
+        try:
+            select = self.query_one("#source-select", GroupedSelect)
+        except Exception:
+            return
+        select.set_options(self._device_options())
+        if self._device_entry(self._current_device_index):
+            select.value = self._current_device_index
 
 
 # ---------------------------------------------------------------------------

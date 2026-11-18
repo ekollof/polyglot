@@ -1,5 +1,5 @@
 """
-suppress_alsa.py — Silence PortAudio/ALSA stderr noise during PyAudio use.
+suppress_alsa.py — suppress native library noise from PortAudio/ALSA, JACK, and MIOpen.
 
 The ALSA messages come from C-level fprintf() calls deep inside libportaudio
 and libasound. They cannot be silenced via Python's sys.stderr or environment
@@ -34,6 +34,14 @@ from contextlib import contextmanager
 # client state from reaching the codepath that asserts on Pa_Terminate.
 # Must be set before the first Pa_Initialize (i.e. before any pyaudio import).
 os.environ.setdefault("JACK_NO_START_SERVER", "1")
+
+# MIOpen writes warnings from C++ straight to stderr, bypassing logging. On
+# gfx1030 it reports a missing CK grouped-conv library the first time Whisper
+# runs a convolution, which corrupts the Textual screen. Level 4 is the
+# release default (errors + warnings); level 3 keeps errors and drops the
+# warning. Must be set before the first MIOpen call, hence before torch loads
+# a convolution.
+os.environ.setdefault("MIOPEN_LOG_LEVEL", "3")
 
 # Process-wide lock: only one thread may redirect stderr at a time.
 # This prevents the redirect from racing with torch/ROCm subprocess spawning.

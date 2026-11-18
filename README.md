@@ -2,7 +2,7 @@
 
 Real-time multilingual transcription and translation TUI.
 
-Listens to any audio source (applications, monitors, hardware inputs), transcribes speech with [Whisper](https://github.com/openai/whisper), detects the spoken language automatically, and translates to your chosen target language — all live in a terminal UI.
+Listens to any audio source (applications, monitors, hardware inputs), transcribes speech with [Whisper](https://github.com/openai/whisper), detects the spoken language automatically, and translates to your chosen target language — all live in a terminal UI. Capture is a passive tap on PipeWire's graph: Polyglot never opens a raw ALSA device, so it cannot take the sound card away from another application.
 
 ```
 ┌────────────────────────┬────────────────────────┐
@@ -127,12 +127,16 @@ uv run --no-sync python app.py
 
 ## Translation engines
 
+The **Translate** selector lists concrete models, not just engines. Missing models are downloaded on demand after a confirmation dialog shows their size. Ollama is the default, so transcription works without sending text to a web service.
+
 | Engine | Requires | Notes |
 |--------|----------|-------|
 | Google | Internet | Fast, high quality |
 | MyMemory | Internet | Free tier, rate-limited |
 | LibreTranslate | Self-hosted or Internet | Set URL in code |
-| Ollama | Local Ollama server | Needs a model pulled, e.g. `ollama pull mistral` |
+| Ollama | Local Ollama server | **Default.** `aya-expanse:8b` is pulled on demand after confirmation; also offers `qwen2.5:7b`, `gemma2:9b`. Override the list with `POLYGLOT_OLLAMA_MODEL`, server with `POLYGLOT_OLLAMA_URL` |
+| OpenAI-compatible | Local or hosted endpoint | `/chat/completions`: LM Studio, llama.cpp server, vLLM, OpenRouter, Groq. Configure with `POLYGLOT_OPENAI_URL`, `POLYGLOT_OPENAI_MODEL`, `POLYGLOT_OPENAI_API_KEY` |
+| NLLB-200 | None (offline) | 200 languages via `transformers`, runs on the GPU; model downloads on first use (`POLYGLOT_NLLB_MODEL`, default `facebook/nllb-200-distilled-600M`; use `facebook/nllb-200-distilled-1.3B` for better quality) |
 | Argos | None (offline) | Downloads language packages on first use |
 
 ## Architecture

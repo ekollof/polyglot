@@ -7,17 +7,21 @@ Supported engines (selectable at runtime via set_engine()):
   libretranslate— LibreTranslate REST API; configurable base URL for
                   self-hosted instances (needs internet or local server)
   ollama        — Local LLM inference via Ollama REST API (offline, GPU)
+  openai        — Any OpenAI-compatible /chat/completions endpoint:
+                  LM Studio, llama.cpp server, vLLM, OpenRouter, Groq, …
+  nllb          — NLLB-200 via transformers (offline, GPU, 200 languages)
   argos         — argostranslate fully offline; packages downloaded on demand
 
 Fallback:
-  When the active online engine fails (network error / timeout), the call
-  falls through to argostranslate automatically.  A background probe restores
-  the primary engine after connectivity returns (every 30 s).
+  When the active engine fails (network error / timeout / missing model),
+  the call falls through to argostranslate automatically.  A background probe
+  restores the primary engine after connectivity returns (every 30 s).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import threading
 import time
@@ -36,6 +40,8 @@ ENGINE_GOOGLE = "google"
 ENGINE_MYMEMORY = "mymemory"
 ENGINE_LIBRETRANSLATE = "libretranslate"
 ENGINE_OLLAMA = "ollama"
+ENGINE_OPENAI = "openai"
+ENGINE_NLLB = "nllb"
 ENGINE_ARGOS = "argos"
 
 _ONLINE_ENGINES = {ENGINE_GOOGLE, ENGINE_MYMEMORY, ENGINE_LIBRETRANSLATE}
@@ -49,7 +55,21 @@ _PROBE_HOST = "translate.googleapis.com"
 _LIBRETRANSLATE_DEFAULT_URL = "https://libretranslate.com"
 # Ollama default endpoint and model.
 _OLLAMA_DEFAULT_URL = "http://localhost:11434"
-_OLLAMA_DEFAULT_MODEL = "mistral"
+_OLLAMA_DEFAULT_MODEL = "aya-expanse:8b"
+# OpenAI-compatible endpoint; Ollama exposes this path as well.
+_OPENAI_DEFAULT_URL = "http://localhost:11434/v1"
+_OPENAI_DEFAULT_MODEL = "mistral"
+# NLLB default model: 600M distilled is fast enough for live sentences.
+_NLLB_DEFAULT_MODEL = "facebook/nllb-200-distilled-600M"
+
+# Shared instruction for every LLM-backed engine.
+_LLM_SYSTEM_PROMPT = (
+    "You are a silent translation engine. "
+    "When given text, you output ONLY the translated text — "
+    "no explanations, no notes, no prefixes, no quotes, no labels. "
+    "Never say 'Here is the translation' or anything similar. "
+    "If the input is already in the target language, output it unchanged."
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -111,8 +131,12 @@ class Translator:
         on_status: Optional[StatusCallback] = None,
         libretranslate_url: str = _LIBRETRANSLATE_DEFAULT_URL,
         libretranslate_api_key: str = "",
-        ollama_url: str = _OLLAMA_DEFAULT_URL,
-        ollama_model: str = _OLLAMA_DEFAULT_MODEL,
+        ollama_url: Optional[str] = None,
+        ollama_model: Optional[str] = None,
+        openai_url: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        openai_model: Optional[str] = None,
+        nllb_model: Optional[str] = None,
     ):
         self._on_status = on_status or (lambda s: None)
         self._lock = threading.Lock()
@@ -129,8 +153,36 @@ class Translator:
         self._libretranslate_api_key = libretranslate_api_key
 
         # Ollama config
-        self._ollama_url = ollama_url.rstrip("/")
-        self._ollama_model = ollama_model
+        self._ollama_url = (
+            ollama_url or os.environ.get("POLYGLOT_OLLAMA_URL") or _OLLAMA_DEFAULT_URL
+        ).rstrip("/")
+        self._ollama_model = (
+            ollama_model
+            or os.environ.get("POLYGLOT_OLLAMA_MODEL")
+            or _OLLAMA_DEFAULT_MODEL
+        )
+
+        # OpenAI-compatible config (env overrides keep keys out of the source)
+        self._openai_url = (
+            openai_url or os.environ.get("POLYGLOT_OPENAI_URL") or _OPENAI_DEFAULT_URL
+        ).rstrip("/")
+        self._openai_api_key = (
+            openai_api_key
+            if openai_api_key is not None
+            else os.environ.get("POLYGLOT_OPENAI_API_KEY", "")
+        )
+        self._openai_model = (
+            openai_model
+            or os.environ.get("POLYGLOT_OPENAI_MODEL")
+            or _OPENAI_DEFAULT_MODEL
+        )
+
+        # NLLB config and lazily loaded model
+        self._nllb_model_name = (
+            nllb_model or os.environ.get("POLYGLOT_NLLB_MODEL") or _NLLB_DEFAULT_MODEL
+        )
+        self._nllb_lock = threading.Lock()
+        self._nllb = None  # (tokenizer, model, device)
 
         # argostranslate package tracking
         self._installed_pairs: set[tuple[str, str]] = set()
@@ -147,15 +199,109 @@ class Translator:
     def set_engine(self, engine: str) -> None:
         """Switch the active translation engine.  Thread-safe."""
         with self._lock:
+            previous = self._engine
             self._engine = engine
+        if previous == ENGINE_NLLB and engine != ENGINE_NLLB:
+            self._release_nllb()
         logger.info("Translation engine changed to '%s'.", engine)
         self._on_status(f"Translation engine: {engine}")
+
+    def _release_nllb(self) -> None:
+        """Free the NLLB model when another engine takes over."""
+        with self._nllb_lock:
+            if self._nllb is None:
+                return
+            self._nllb = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.info("Released NLLB model")
 
     def set_ollama_model(self, model: str) -> None:
         """Switch the Ollama model used for translation.  Thread-safe."""
         with self._lock:
             self._ollama_model = model
         logger.info("Ollama model changed to '%s'.", model)
+
+    def set_nllb_model(self, model: str) -> None:
+        """Switch the NLLB model; the next call reloads it.  Thread-safe."""
+        if model == self._nllb_model_name:
+            return
+        self._release_nllb()
+        with self._nllb_lock:
+            self._nllb_model_name = model
+        logger.info("NLLB model changed to '%s'.", model)
+
+    # ------------------------------------------------------------------
+    # Model availability / on-demand download
+    # ------------------------------------------------------------------
+
+    def is_model_available(self, engine: str, model: str = "") -> bool:
+        """Whether *model* is already present locally for *engine*."""
+        if engine == ENGINE_OLLAMA:
+            names = self.ollama_models()
+            if names is None:
+                return False
+            return model in names or f"{model}:latest" in names
+        if engine == ENGINE_NLLB:
+            return _nllb_model_cached(model)
+        return True
+
+    def ollama_models(self) -> Optional[set[str]]:
+        """Installed Ollama model names, or None when the server is unreachable."""
+        try:
+            import requests
+
+            resp = requests.get(f"{self._ollama_url}/api/tags", timeout=3)
+            resp.raise_for_status()
+            return {entry["name"] for entry in resp.json().get("models", [])}
+        except Exception as exc:
+            logger.debug("Ollama tags query failed: %s", exc)
+            return None
+
+    def pull_model(self, engine: str, model: str, on_progress=None) -> bool:
+        """Download *model* for *engine*.  Blocking; call from a worker thread."""
+        if engine == ENGINE_OLLAMA:
+            return self._pull_ollama(model, on_progress)
+        if engine == ENGINE_NLLB:
+            return _download_nllb(model, on_progress)
+        return True
+
+    def _pull_ollama(self, model: str, on_progress=None) -> bool:
+        try:
+            import json
+
+            import requests
+
+            with requests.post(
+                f"{self._ollama_url}/api/pull",
+                json={"model": model, "stream": True},
+                stream=True,
+                timeout=(5, 3600),
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if data.get("error"):
+                        raise RuntimeError(data["error"])
+                    if on_progress:
+                        total = data.get("total")
+                        completed = data.get("completed")
+                        if total and completed:
+                            on_progress(f"Pulling {model}… {completed / total * 100:.0f}%")
+                        elif data.get("status"):
+                            on_progress(f"{data['status']} — {model}")
+            logger.info("Ollama model %s pulled", model)
+            return True
+        except Exception as exc:
+            logger.warning("Ollama pull failed (%s): %s", model, exc)
+            return False
 
     @property
     def engine(self) -> str:
@@ -182,7 +328,33 @@ class Translator:
 
         if engine == ENGINE_OLLAMA:
             result = self._ollama_translate(text, from_lang, to_lang)
-            return result if result is not None else text
+            if result is not None:
+                return result
+            logger.warning(
+                "Ollama failed (%s→%s), falling back to argostranslate.",
+                from_lang,
+                to_lang,
+            )
+            self._on_status("ollama unavailable — using offline fallback")
+            return self._argo_translate(text, from_lang, to_lang)
+
+        if engine == ENGINE_OPENAI:
+            result = self._openai_translate(text, from_lang, to_lang)
+            if result is not None:
+                return result
+            logger.warning(
+                "OpenAI-compatible endpoint failed (%s→%s), falling back to argostranslate.",
+                from_lang,
+                to_lang,
+            )
+            self._on_status("openai unavailable — using offline fallback")
+            return self._argo_translate(text, from_lang, to_lang)
+
+        if engine == ENGINE_NLLB:
+            result = self._nllb_translate(text, from_lang, to_lang)
+            return result if result is not None else self._argo_translate(
+                text, from_lang, to_lang
+            )
 
         # Online engine — try primary, fall back to argos on failure.
         if self._check_online():
@@ -352,37 +524,133 @@ class Translator:
         try:
             import requests  # system-wide
 
-            # Language display names for a more natural prompt.
-            from_name = _LANG_NAMES.get(from_lang, from_lang)
-            to_name = _LANG_NAMES.get(to_lang, to_lang)
-            system = (
-                "You are a silent translation engine. "
-                "When given text, you output ONLY the translated text — "
-                "no explanations, no notes, no prefixes, no quotes, no labels. "
-                "Never say 'Here is the translation' or anything similar. "
-                "If the input is already in the target language, output it unchanged."
-            )
-            prompt = f"Translate the following {from_name} text to {to_name}.\n\n{text}"
             resp = requests.post(
                 f"{self._ollama_url}/api/generate",
                 json={
                     "model": self._ollama_model,
-                    "system": system,
-                    "prompt": prompt,
+                    "system": _LLM_SYSTEM_PROMPT,
+                    "prompt": _llm_prompt(text, from_lang, to_lang),
                     "stream": False,
+                    # Translation should be repeatable, not creative.
+                    "options": {"temperature": 0},
                 },
                 timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
-            result = data.get("response", "").strip()
-            # Strip any leading/trailing quotes the model might add.
-            if result and result[0] in ('"', "'") and result[-1] == result[0]:
-                result = result[1:-1].strip()
-            return result or None
+            return _clean_llm_output(data.get("response", "")) or None
         except Exception as exc:
             logger.debug("Ollama error (%s→%s): %s", from_lang, to_lang, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # OpenAI-compatible chat completions
+    # ------------------------------------------------------------------
+
+    def _openai_translate(
+        self, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        """Translate via any /chat/completions endpoint (LM Studio, vLLM, …)."""
+        try:
+            import requests  # system-wide
+
+            headers = {}
+            if self._openai_api_key:
+                headers["Authorization"] = f"Bearer {self._openai_api_key}"
+            resp = requests.post(
+                f"{self._openai_url}/chat/completions",
+                json={
+                    "model": self._openai_model,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": _llm_prompt(text, from_lang, to_lang),
+                        },
+                    ],
+                },
+                headers=headers or None,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return _clean_llm_output(content) or None
+        except Exception as exc:
+            logger.debug(
+                "OpenAI-compatible error (%s→%s): %s", from_lang, to_lang, exc
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # NLLB-200 (local, transformers)
+    # ------------------------------------------------------------------
+
+    def _nllb_translate(
+        self, text: str, from_lang: str, to_lang: str
+    ) -> Optional[str]:
+        source = _NLLB_CODES.get(from_lang)
+        target = _NLLB_CODES.get(to_lang)
+        if not source or not target:
+            logger.debug("NLLB has no code for %s→%s", from_lang, to_lang)
+            return None
+        try:
+            return self._nllb_generate(text, source, target)
+        except Exception as exc:
+            logger.warning("NLLB error (%s→%s): %s", from_lang, to_lang, exc)
+            return None
+
+    def _nllb_resources(self):
+        """Load tokenizer/model on first use; Inference threads share them."""
+        with self._nllb_lock:
+            if self._nllb is not None:
+                return self._nllb
+            import torch
+
+            # Native download/load output would corrupt the Textual screen:
+            # keep huggingface_hub and transformers quiet on stderr.
+            _quiet_hf()
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+            self._on_status(f"Loading NLLB model {self._nllb_model_name}…")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = torch.float16 if device == "cuda" else torch.float32
+            tokenizer = AutoTokenizer.from_pretrained(self._nllb_model_name)
+            try:
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    self._nllb_model_name, dtype=dtype
+                )
+            except TypeError:  # transformers < 5 spells the argument differently
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    self._nllb_model_name, torch_dtype=dtype
+                )
+            model = model.to(device).eval()
+            self._nllb = (tokenizer, model, device)
+            logger.info("NLLB model %s loaded on %s", self._nllb_model_name, device)
+            self._on_status("NLLB ready")
+            return self._nllb
+
+    def _nllb_generate(self, text: str, source: str, target: str) -> Optional[str]:
+        import torch
+
+        tokenizer, model, device = self._nllb_resources()
+        with self._nllb_lock:  # serialise generation; sentences are short
+            batch = tokenizer(
+                text,
+                src_lang=source,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            ).to(device)
+            with torch.no_grad():
+                generated = model.generate(
+                    **batch,
+                    forced_bos_token_id=tokenizer.convert_tokens_to_ids(target),
+                    max_length=256,
+                    num_beams=1,
+                )
+        return tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip() or None
 
     # ------------------------------------------------------------------
     # argostranslate fallback
@@ -418,7 +686,16 @@ class Translator:
 
             langs = {lang.code: lang for lang in at.get_installed_languages()}
             if from_lang in langs:
-                targets = {t.code for t in langs[from_lang].translations_to}
+                # translations_to holds CachedTranslation objects exposing
+                # .to_lang (a Language); .code does not exist on them.
+                targets = set()
+                for translation in langs[from_lang].translations_to:
+                    target = getattr(translation, "to_lang", None)
+                    code = getattr(target, "code", None) or getattr(
+                        translation, "to_code", None
+                    )
+                    if code:
+                        targets.add(code)
                 if to_lang in targets:
                     with self._lock:
                         self._installed_pairs.add(pair)
@@ -529,4 +806,152 @@ _LANG_NAMES: dict[str, str] = {
     "tl": "Filipino",
     "ur": "Urdu",
     "uz": "Uzbek",
+}
+
+
+# ---------------------------------------------------------------------------
+# LLM prompt helpers (Ollama and OpenAI-compatible engines)
+# ---------------------------------------------------------------------------
+
+
+def _llm_prompt(text: str, from_lang: str, to_lang: str) -> str:
+    from_name = _LANG_NAMES.get(from_lang, from_lang)
+    to_name = _LANG_NAMES.get(to_lang, to_lang)
+    return f"Translate the following {from_name} text to {to_name}.\n\n{text}"
+
+
+def _clean_llm_output(result: str) -> str:
+    """Strip whitespace and a single pair of wrapping quotes."""
+    result = (result or "").strip()
+    if len(result) >= 2 and result[0] in ('"', "'") and result[-1] == result[0]:
+        result = result[1:-1].strip()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# NLLB-200 language codes
+# ---------------------------------------------------------------------------
+# NLLB uses BCP-47-like codes with script tags; map the ISO-639-1 codes that
+# Whisper emits.  Languages missing here fall back to argostranslate.
+
+
+def _quiet_hf() -> None:
+    """Keep huggingface download/progress output off the Textual screen."""
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import logging as hub_logging
+
+        hub_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
+def _nllb_model_cached(model_name: str) -> bool:
+    """Whether config + weights for *model_name* are already in the HF cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:
+        return False
+    try:
+        config = try_to_load_from_cache(model_name, "config.json")
+        if not isinstance(config, str):
+            return False
+        for filename in (
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.safetensors.index.json",
+        ):
+            if isinstance(try_to_load_from_cache(model_name, filename), str):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _download_nllb(model_name: str, on_progress=None) -> bool:
+    try:
+        _quiet_hf()
+        from huggingface_hub import snapshot_download
+
+        if on_progress:
+            on_progress(f"Downloading {model_name}…")
+        snapshot_download(repo_id=model_name)
+        logger.info("NLLB model %s downloaded", model_name)
+        return True
+    except Exception as exc:
+        logger.warning("NLLB download failed (%s): %s", model_name, exc)
+        return False
+
+_NLLB_CODES: dict[str, str] = {
+    "af": "afr_Latn",
+    "ar": "arb_Arab",
+    "az": "azj_Latn",
+    "be": "bel_Cyrl",
+    "bg": "bul_Cyrl",
+    "bn": "ben_Beng",
+    "bs": "bos_Latn",
+    "ca": "cat_Latn",
+    "cs": "ces_Latn",
+    "da": "dan_Latn",
+    "de": "deu_Latn",
+    "el": "ell_Grek",
+    "en": "eng_Latn",
+    "es": "spa_Latn",
+    "et": "est_Latn",
+    "eu": "eus_Latn",
+    "fa": "pes_Arab",
+    "fi": "fin_Latn",
+    "fr": "fra_Latn",
+    "gl": "glg_Latn",
+    "gu": "guj_Gujr",
+    "he": "heb_Hebr",
+    "hi": "hin_Deva",
+    "hr": "hrv_Latn",
+    "hu": "hun_Latn",
+    "hy": "hye_Armn",
+    "id": "ind_Latn",
+    "is": "isl_Latn",
+    "it": "ita_Latn",
+    "ja": "jpn_Jpan",
+    "ka": "kat_Geor",
+    "kk": "kaz_Cyrl",
+    "ko": "kor_Hang",
+    "lt": "lit_Latn",
+    "lv": "lvs_Latn",
+    "mk": "mkd_Cyrl",
+    "ml": "mal_Mlym",
+    "mn": "khk_Cyrl",
+    "mr": "mar_Deva",
+    "ms": "zsm_Latn",
+    "ne": "npi_Deva",
+    "nl": "nld_Latn",
+    "no": "nob_Latn",
+    "pa": "pan_Guru",
+    "pl": "pol_Latn",
+    "pt": "por_Latn",
+    "ro": "ron_Latn",
+    "ru": "rus_Cyrl",
+    "sk": "slk_Latn",
+    "sl": "slv_Latn",
+    "sq": "als_Latn",
+    "sr": "srp_Cyrl",
+    "sv": "swe_Latn",
+    "sw": "swh_Latn",
+    "ta": "tam_Taml",
+    "te": "tel_Telu",
+    "th": "tha_Thai",
+    "tl": "tgl_Latn",
+    "tr": "tur_Latn",
+    "uk": "ukr_Cyrl",
+    "ur": "urd_Arab",
+    "uz": "uzn_Latn",
+    "vi": "vie_Latn",
+    "zh": "zho_Hans",
 }
