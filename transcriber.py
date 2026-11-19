@@ -459,12 +459,16 @@ class Transcriber:
         on_non_speech: Optional[NonSpeechCallback] = None,
         model_name: str = "turbo",
         device: Optional[str] = None,
+        on_state: Optional[Callable[[str], None]] = None,
     ):
         self.audio_queue = audio_queue
         self.on_result = on_result
         self.on_partial = on_partial
         self.on_speaker_change = on_speaker_change
         self.on_non_speech = on_non_speech
+        self._on_state = on_state
+        self._state = "listening"
+        self._speech_active = False
         self.model_name = model_name
         self._requested_device = device
         self._backend_name = "Detecting accelerator…"
@@ -749,12 +753,14 @@ class Transcriber:
                         force=True,
                     )
                 self._reset_language_context(item[1] if len(item) > 1 else None)
+                self._set_state("listening")
             elif kind == "detect":
                 self._infer_detect(
                     whisper_model, item[1], item[2] if len(item) > 2 else None
                 )
             elif kind == "partial":
                 if self._partials_enabled:
+                    self._set_state("transcribing")
                     started = time.monotonic()
                     self._infer_partial(whisper_model, item[1], item[2])
                     if len(item[1]) >= 2 * WHISPER_RATE:
@@ -762,9 +768,13 @@ class Transcriber:
                             time.monotonic() - started
                             < self._rolling_commit_seconds * 0.25
                         )
+                    self._set_state(
+                        "speech" if self._speech_active else "listening"
+                    )
             elif kind == "commit":
                 captured_at = item[3] if len(item) > 3 else time.monotonic()
                 started = time.monotonic()
+                self._set_state("committing")
                 queue_delay = max(0.0, started - captured_at)
                 self._quality_retry_allowed = queue_delay < 1.0 and not any(
                     work[0] == "commit" for work in pending
@@ -796,6 +806,20 @@ class Transcriber:
                     self._rolling_commit_seconds,
                     self._partials_enabled,
                 )
+                if self._speech_active:
+                    self._set_state("speech")
+                elif pending or not self._infer_queue.empty():
+                    self._set_state("committing")
+                else:
+                    self._set_state("listening")
+
+    def _set_state(self, state: str) -> None:
+        """Report pipeline activity to the UI (deduplicated across threads)."""
+        if state == self._state:
+            return
+        self._state = state
+        if self._on_state:
+            self._on_state(state)
 
     def _reset_language_context(self, captured_at=None):
         logger.debug("Resetting language context after silence")
@@ -1617,6 +1641,8 @@ class Transcriber:
                 elif "start" in event:
                     logger.debug("VAD start at sample %d", utterance_samples)
                     _speech_active = True
+                    self._speech_active = True
+                    self._set_state("speech")
                     # Include a short pre-roll so the onset phoneme is not
                     # clipped.  We already have the audio in utterance[]; just
                     # move the speech-start pointer back by VAD_PREROLL_S.
@@ -1631,6 +1657,8 @@ class Transcriber:
                 elif "end" in event:
                     logger.debug("VAD end at sample %d", utterance_samples)
                     _speech_active = False
+                    self._speech_active = False
+                    self._set_state("committing")
                     _silence_start_time = time.monotonic()
                     _silence_reset_sent = False
                     _detection_triggered = False

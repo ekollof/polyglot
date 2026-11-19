@@ -73,6 +73,7 @@ Do not introduce `threading.Lock`, semaphores, or any explicit synchronisation. 
 
 - Always read `/tmp/polyglot.log` before diagnosing issues
 - Background work (model loads, downloads, releases, device waits) runs off the UI thread and reports through `_set_activity`, which outranks the listening line until cleared or expired
+- The transcriber reports pipeline state through `on_state` (`listening`, `speech`, `transcribing`, `committing`); the app renders it in the status bar ahead of the device/language line
 - Syntax-check with `.venv/bin/python -m py_compile` after every edit
 - LSP/pyright type annotation warnings are cosmetic — do not fix them unless asked
 - Do not pin source language — keep auto-detection. Commits may decode with the *detected* language as a hint (`_commit_language_hint`), but never force a configured language, and `_decode_commit` must keep its auto-detect fallback when the hinted decode scores worse

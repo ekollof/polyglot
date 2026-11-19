@@ -315,6 +315,15 @@ class SpeechQualityTests(unittest.TestCase):
         self.assertEqual(transcriber._detected_lang, "it")
         self.assertEqual(model.detect_language.call_count, 3)
 
+    def test_pipeline_state_reports_only_changes(self):
+        states = []
+        transcriber = Transcriber(queue.Queue(), Mock(), on_state=states.append)
+        transcriber._set_state("speech")
+        transcriber._set_state("speech")
+        transcriber._set_state("committing")
+        transcriber._set_state("listening")
+        self.assertEqual(states, ["speech", "committing", "listening"])
+
     def test_reset_keeps_the_language_but_invalidates_old_audio_evidence(self):
         transcriber = self.transcriber()
         transcriber._detected_lang = "en"

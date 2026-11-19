@@ -11,6 +11,8 @@ from app import (
     ConfirmDownload,
     PolyglotApp,
     TRANSLATION_ENGINES,
+    _make_lang_tag_line,
+    _merged_line_lang,
 )
 from translator import ENGINE_OLLAMA
 
@@ -239,6 +241,169 @@ class SentenceTranslationTests(unittest.IsolatedAsyncioTestCase):
             app._activate_engine(ENGINE_OLLAMA, "qwen2.5:7b", "ollama:qwen2.5:7b")
             app._translator.set_engine.assert_called_with(ENGINE_OLLAMA)
             app._translator.set_ollama_model.assert_called_once_with("qwen2.5:7b")
+
+    async def test_hold_timer_reverts_after_its_deadline(self):
+        import asyncio
+
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            app.action_hold_original()
+            self.assertTrue(app.has_class("show-original"))
+            await asyncio.sleep(1.2)
+            await pilot.pause()
+            self.assertFalse(app.has_class("show-original"))
+
+    async def test_stale_hold_timers_are_ignored(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            app.action_hold_original()
+            app.action_hold_original()  # repeat: a new generation replaces the old
+            stale = app._hold_generation - 1
+            app._release_original(stale)
+            self.assertTrue(app.has_class("show-original"))
+            app._release_original(app._hold_generation)
+            self.assertFalse(app.has_class("show-original"))
+            # Turning one-pane off invalidates a pending hold as well.
+            app.action_hold_original()
+            generation = app._hold_generation
+            app.action_toggle_single_pane()
+            app._release_original(generation)
+            self.assertFalse(app.has_class("show-original"))
+
+    async def test_one_pane_mode_shows_the_merged_log(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            self.assertTrue(app.has_class("one-pane"))
+            self.assertEqual(app.query_one("#source-pane").styles.display, "none")
+            self.assertEqual(
+                app.query_one("#translation-pane").styles.display, "none"
+            )
+            self.assertEqual(app.query_one("#merged-pane").styles.display, "block")
+            app.action_toggle_single_pane()
+            self.assertFalse(app.has_class("one-pane"))
+            await pilot.pause()
+            self.assertEqual(app.query_one("#source-pane").styles.display, "block")
+            self.assertEqual(app.query_one("#merged-pane").styles.display, "none")
+
+    async def test_translation_justification_follows_the_target_language(self):
+        english = _make_lang_tag_line("Hello", "fa", 0.9, True, to_lang="en")
+        self.assertEqual(english.justify, "left")
+        persian = _make_lang_tag_line("سلام", "en", 0.9, True, to_lang="fa")
+        self.assertEqual(persian.justify, "right")
+
+    async def test_merged_pane_keeps_the_readers_scroll_position(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 12)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            log = app.query_one("#merged-log", RichLog)
+            for row_id in range(30):
+                app._finalise_source(row_id, f"source {row_id}", "fa")
+            await pilot.pause()
+            log.scroll_y = 0
+            await pilot.pause()
+            app._update_translation_row(29, "last translation", True, "fa", 0.9)
+            await pilot.pause()
+            self.assertEqual(log.scroll_y, 0)
+            self.assertIn(
+                "last translation", "\n".join(line.text for line in log.lines)
+            )
+
+    async def test_many_rows_survive_interleaved_updates(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            log = app.query_one("#merged-log", RichLog)
+            for row_id in range(30):
+                app._show_live_partial(f"preview {row_id}", "fa")
+                app._finalise_source(row_id, f"source {row_id}", "fa")
+                app._update_translation_row(
+                    row_id, f"translation {row_id}", True, "fa", 0.9
+                )
+            await pilot.pause()
+            shown = "\n".join(line.text for line in log.lines)
+            self.assertEqual(len(app._merged_rows), 30)
+            for row_id in range(30):
+                self.assertIn(f"translation {row_id}", shown)
+
+    async def test_multiple_translations_survive_repeated_renders(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            log = app.query_one("#merged-log", RichLog)
+            pairs = [
+                ("اولین جمله", "First sentence"),
+                ("دومین جمله", "Second sentence"),
+                ("سومین جمله", "Third sentence"),
+                ("چهارمین جمله", "Fourth sentence"),
+            ]
+            for row_id, (source, translation) in enumerate(pairs):
+                app._finalise_source(row_id, source, "fa")
+                app._show_live_partial("next partial", "fa")
+                app._update_translation_row(row_id, translation, True, "fa", 0.9)
+            await pilot.pause()
+            shown = "\n".join(line.text for line in log.lines)
+            for _, translation in pairs:
+                self.assertIn(translation, shown)
+            self.assertEqual(len(app._merged_rows), len(pairs))
+
+    async def test_source_lines_are_replaced_by_translations_in_one_pane(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_toggle_single_pane()
+            log = app.query_one("#merged-log", RichLog)
+            app._finalise_source(0, "سلام دنیا", "fa")
+            await pilot.pause()
+            self.assertIn("سلام دنیا", "\n".join(line.text for line in log.lines))
+            app._update_translation_row(0, "Hello world", True, "fa", 0.9)
+            await pilot.pause()
+            self.assertEqual(app._merged_rows[0]["target_lang"], "en")
+            self.assertEqual(
+                _merged_line_lang(app._merged_rows[0], False, "en"), "en"
+            )
+            shown = "\n".join(line.text for line in log.lines)
+            self.assertIn("Hello world", shown)
+            self.assertNotIn("سلام دنیا", shown)
+            app.action_hold_original()
+            await pilot.pause()
+            shown = "\n".join(line.text for line in log.lines)
+            self.assertIn("سلام دنیا", shown)
+            self.assertNotIn("Hello world", shown)
+            app._release_original()
+            await pilot.pause()
+            shown = "\n".join(line.text for line in log.lines)
+            self.assertIn("Hello world", shown)
+
+    async def test_hold_original_is_a_noop_without_one_pane_mode(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_hold_original()
+            self.assertFalse(app.has_class("show-original"))
+
+    async def test_pipeline_state_is_shown_in_the_status_bar(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._model_ready = True
+            status = app.query_one("#status-bar", Label)
+            for state, label in (
+                ("speech", "Speech"),
+                ("transcribing", "Transcribing"),
+                ("committing", "Committing"),
+                ("listening", "Listening"),
+            ):
+                app._apply_pipeline_state(state)
+                self.assertIn(label, str(status.render()))
 
     async def test_background_activity_owns_the_status_bar(self):
         app = self.make_app()

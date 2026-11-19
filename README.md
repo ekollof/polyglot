@@ -21,7 +21,8 @@ Listens to any audio source (applications, monitors, hardware inputs), transcrib
 - **Sentence-based translation** — unfinished text is joined across rolling audio chunks before translation, with completed sentences translated concurrently
 - **Multiple translation engines** — Ollama (default), NLLB-200, OpenAI-compatible endpoints, Google, MyMemory, LibreTranslate, Argos; missing models download on demand after a confirmation dialog
 - **Passive audio capture** — taps PipeWire sources (applications, monitors) through JACK; never opens a raw ALSA device, so other applications keep playing
-- **Live background status** — the status bar reports model loads, engine switches, model downloads and device reconnects; everything that can block runs off the UI thread
+- **One-pane mode** — `v` switches to a single log where source lines appear immediately and are replaced by their translations as they arrive; hold `o` to see the originals again
+- **Live background status** — the status bar shows the pipeline state (Listening, Speech, Transcribing, Committing) plus background work: model loads, engine switches, downloads and device reconnects; everything that can block runs off the UI thread
 - **Robust language ID** — detection runs on a rolling 5–30 s buffer of confirmed speech rather than raw 3 s VAD snapshots
 - **Script-mismatch suppression** — Latin-script partials are suppressed when the active language is Arabic/Persian-script and vice versa
 - **Speaker-change detection** — visual separator inserted when encoder embeddings differ between utterances
@@ -163,6 +164,10 @@ Downloaded translation models live in the usual caches: Ollama's own store, Hugg
 | `t` | Focus target language selector |
 | `m` | Focus Whisper model selector |
 | `e` | Focus translation engine selector |
+| `v` | Toggle one-pane mode (translations replace the original pane) |
+| `o` (hold) | In one-pane mode, show the original; release for translations |
+
+Textual has no key-release event, so the hold uses key repeats: while `o` is pressed the original stays visible, and the view reverts about one second after the last repeat. The normal two-pane logs keep receiving the same content in both modes; one-pane mode renders them from row data with the source shown first and the translation swapped in on arrival. Justification follows the text being displayed: a Persian source is right-justified, its English translation left-justified.
 
 ## Translation engines
 

@@ -94,16 +94,18 @@ def _make_lang_tag_line(
     from_lang: str,
     confidence: Optional[float],
     is_final: bool,
+    to_lang: str = "en",
 ) -> Text:
     """Build a Rich Text line with a dim tag prefix and the translation body.
 
     The tag is always dim so it doesn't compete visually with the translation.
     The translation body is normal weight for final results, dim italic for
-    in-progress partials.
+    in-progress partials.  Justification follows the *target* language: an
+    English translation of Persian audio is left-justified, not right-justified.
     """
     tag = _lang_tag(from_lang, confidence)
     body_style = "" if is_final else "dim italic"
-    line = Text("", justify="left")
+    line = Text("", justify="right" if to_lang in _RTL_LANGS else "left")
     line.append(tag, style="dim")
     line.append(translation, style=body_style)
     return line
@@ -117,6 +119,13 @@ def _make_text(text: str, style: str = "", lang: str = "") -> Text:
     """
     justify = "right" if lang in _RTL_LANGS else "left"
     return Text(text, style=style, justify=justify)
+
+
+def _merged_line_lang(row: dict, show_source: bool, target_lang: str) -> str:
+    """Language whose direction a one-pane row should use."""
+    if show_source:
+        return row["lang"]
+    return row.get("target_lang") or target_lang
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +332,21 @@ Screen {
     width: 1fr;
     border: solid $primary-darken-2;
     padding: 0 1;
+}
+
+/* One-pane mode shows a single log: source text first, then each row is
+   replaced by its translation when it arrives.  Holding 'o' shows sources. */
+#merged-pane {
+    display: none;
+}
+
+.one-pane #source-pane,
+.one-pane #translation-pane {
+    display: none;
+}
+
+.one-pane #merged-pane {
+    display: block;
 }
 
 .pane-title {
@@ -542,6 +566,8 @@ class PolyglotApp(App):
         Binding("t", "focus_target", "Target lang"),
         Binding("m", "focus_model", "Model"),
         Binding("e", "focus_engine", "Engine"),
+        Binding("v", "toggle_single_pane", "One pane"),
+        Binding("o", "hold_original", "Hold original"),
     ]
 
     def __init__(self) -> None:
@@ -561,6 +587,16 @@ class PolyglotApp(App):
         self._model_name: str = "turbo"
         self._engine: str = ENGINE_OLLAMA
         self._engine_option: str = DEFAULT_ENGINE_OPTION
+        self._pipeline_state: str = "listening"
+        self._one_pane = False
+        self._show_original = False
+        self._hold_timer = None
+        self._hold_generation = 0
+        # One-pane rows: source first, replaced by translation on arrival.
+        self._merged_rows: list[dict] = []
+        self._merged_preview: Optional[str] = None
+        self._merged_preview_lang: Optional[str] = None
+        self._merged_signature = None
         # Long-running background work (model loads, downloads, device waits)
         # owns the status bar until it finishes; everything else falls back to
         # the regular listening line.
@@ -611,15 +647,19 @@ class PolyglotApp(App):
         yield Header()
 
         with Horizontal(id="panes"):
-            with Vertical(classes="pane-container"):
+            with Vertical(id="source-pane", classes="pane-container"):
                 yield Static("Source (original)", classes="pane-title")
                 yield RichLog(id="source-log", highlight=False, markup=False, wrap=True)
 
-            with Vertical(classes="pane-container"):
+            with Vertical(id="translation-pane", classes="pane-container"):
                 yield Static("Translation", classes="pane-title")
                 yield RichLog(
                     id="translation-log", highlight=False, markup=False, wrap=True
                 )
+
+            with Vertical(id="merged-pane", classes="pane-container"):
+                yield Static("Translated", id="merged-title", classes="pane-title")
+                yield RichLog(id="merged-log", highlight=False, markup=False, wrap=True)
 
         with Vertical(id="controls"):
             with Horizontal(id="controls-row"):
@@ -721,6 +761,7 @@ class PolyglotApp(App):
             on_partial=self._on_partial_result,
             on_speaker_change=self._on_speaker_change,
             on_non_speech=self._on_non_speech,
+            on_state=self._on_pipeline_state,
             model_name=self._model_name,
         )
         self._transcriber.start()
@@ -741,6 +782,7 @@ class PolyglotApp(App):
         """Stop the current transcriber and start a new one with the selected model."""
         self._flush_sentence_buffer()
         self._model_ready = False
+        self._pipeline_state = "listening"
         self._update_status()
         if self._transcriber:
             self._transcriber.stop()
@@ -750,6 +792,7 @@ class PolyglotApp(App):
             on_partial=self._on_partial_result,
             on_speaker_change=self._on_speaker_change,
             on_non_speech=self._on_non_speech,
+            on_state=self._on_pipeline_state,
             model_name=self._model_name,
         )
         self._transcriber.start()
@@ -888,6 +931,9 @@ class PolyglotApp(App):
         separator = Text("─" * 40, style="dim")
         source_log.write(separator)
         trans_log.write(Text("", style="dim"))  # blank spacer keeps panes aligned
+        self._merged_rows.append({"kind": "separator"})
+        if self._one_pane:
+            self._render_merged()
 
     def _show_partial(self, row_id: int, partial_text: str, detected_lang: str) -> None:
         """Write or update the interim (dim) partial transcription line."""
@@ -911,6 +957,11 @@ class PolyglotApp(App):
             _make_text(partial_text, style="dim italic", lang=detected_lang)
         )
         trans_log.write(Text("…", style="dim italic"))
+
+        if self._one_pane:
+            self._merged_preview = partial_text
+            self._merged_preview_lang = detected_lang
+            self._render_merged()
 
         self._detected_lang = detected_lang
         self._update_status()
@@ -968,6 +1019,19 @@ class PolyglotApp(App):
             self.set_timer(0.0, self._flush_pending_trans)
 
         self._row_count += 1
+        if source_text:
+            self._merged_rows.append(
+                {
+                    "kind": "text",
+                    "row_id": row_id,
+                    "source": source_text,
+                    "translation": None,
+                    "lang": detected_lang,
+                }
+            )
+            self._merged_preview = None
+            if self._one_pane:
+                self._render_merged()
         self._detected_lang = detected_lang
         self._update_status()
 
@@ -1015,7 +1079,11 @@ class PolyglotApp(App):
                 # Replace just the dim partial translation line.
                 self._pop_partial(trans_log, self._trans_strip_start)
                 line = _make_lang_tag_line(
-                    translation, from_lang, confidence, is_final=False
+                    translation,
+                    from_lang,
+                    confidence,
+                    is_final=False,
+                    to_lang=self._target_lang,
                 )
                 trans_log.write(line)
             # If row is no longer pending, the final translation is already in
@@ -1038,6 +1106,16 @@ class PolyglotApp(App):
                 self._pending_trans[row_id] = (translation, from_lang, confidence)
             return
 
+        merged = next(
+            (row for row in self._merged_rows if row.get("row_id") == row_id),
+            None,
+        )
+        if merged is not None:
+            merged["translation"] = translation
+            merged["target_lang"] = self._target_lang
+            if self._one_pane:
+                self._render_merged()
+
         # Save ALL lines that come after slot_start (subsequent slots'
         # placeholders + any dim partial).  We must restore them so that later
         # translations can still find their correct positions.
@@ -1048,7 +1126,13 @@ class PolyglotApp(App):
         # Write the translation in place of the placeholder.
         # Build a Rich Text with a dim language+confidence prefix tag followed
         # by the translation text in normal (or dim italic for partials) style.
-        line = _make_lang_tag_line(translation, from_lang, confidence, is_final)
+        line = _make_lang_tag_line(
+            translation,
+            from_lang,
+            confidence,
+            is_final,
+            to_lang=self._target_lang,
+        )
         trans_log.write(line)
         # A full sentence may wrap; shift slots by its actual rendered height.
         shift = len(trans_log.lines) - slot_start - 1
@@ -1098,6 +1182,22 @@ class PolyglotApp(App):
             self.call_from_thread(self._apply_capture_status, message)
         except Exception:
             pass  # app shutting down
+
+    def _on_pipeline_state(self, state: str) -> None:
+        """Called from the VAD/inference threads with the current activity."""
+        if threading.current_thread() is threading.main_thread():
+            self._apply_pipeline_state(state)
+            return
+        try:
+            self.call_from_thread(self._apply_pipeline_state, state)
+        except Exception:
+            pass  # app shutting down
+
+    def _apply_pipeline_state(self, state: str) -> None:
+        if state == self._pipeline_state:
+            return
+        self._pipeline_state = state
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Widget event handlers
@@ -1223,6 +1323,126 @@ class PolyglotApp(App):
     # Actions
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pane layout
+    # ------------------------------------------------------------------
+
+    def action_toggle_single_pane(self) -> None:
+        self._one_pane = not self._one_pane
+        if not self._one_pane:
+            self._show_original = False
+            self._hold_generation += 1  # invalidate any pending hold timer
+        self._apply_pane_visibility()
+        if self._one_pane:
+            self._merged_signature = None  # widget was hidden; repopulate it
+            self._render_merged()
+        self._set_activity(
+            "One pane — hold 'o' for original" if self._one_pane else "Two panes",
+            "status-listening",
+            duration=3.0,
+        )
+
+    def action_hold_original(self) -> None:
+        if not self._one_pane:
+            return
+        self._show_original = True
+        self._apply_pane_visibility()
+        self._render_merged()
+        # Textual has no key-release event; repeats while the key is held keep
+        # resetting the deadline.  A generation token invalidates old timers
+        # without relying on Timer.cancel()/stop() across Textual versions.
+        self._hold_generation += 1
+        generation = self._hold_generation
+        self._hold_timer = self.set_timer(
+            1.0, lambda: self._release_original(generation)
+        )
+
+    def _release_original(self, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != self._hold_generation:
+            return  # an older hold timer fired after a newer one
+        if not self._show_original:
+            return
+        self._show_original = False
+        self._hold_timer = None
+        self._hold_generation += 1
+        self._apply_pane_visibility()
+        self._render_merged()
+
+    def _apply_pane_visibility(self) -> None:
+        self.set_class(self._one_pane, "one-pane")
+        self.set_class(self._show_original, "show-original")
+
+    def _render_merged(self) -> None:
+        """Redraw the single pane from row data: sources, replaced on arrival."""
+        try:
+            log = self.query_one("#merged-log", RichLog)
+            title = self.query_one("#merged-title", Static)
+        except Exception:
+            return  # widgets not mounted or app shutting down
+
+        signature = (
+            self._show_original,
+            self._target_lang,
+            self._merged_preview,
+            tuple(
+                (
+                    row["kind"],
+                    row.get("source"),
+                    row.get("translation"),
+                    row.get("lang"),
+                    row.get("target_lang"),
+                )
+                for row in self._merged_rows
+            ),
+        )
+        if signature == self._merged_signature:
+            return  # a repeated partial must not rewrite and re-scroll the log
+        self._merged_signature = signature
+
+        title.update("Source (original)" if self._show_original else "Translated")
+        try:
+            max_scroll = max(0, log.virtual_size.height - log.size.height)
+            was_at_end = log.scroll_y >= max_scroll - 1
+            previous_scroll = log.scroll_y
+        except Exception:
+            was_at_end, previous_scroll = True, 0
+
+        log.clear()
+        for row in self._merged_rows:
+            if row["kind"] == "separator":
+                log.write(Text("─" * 40, style="dim"), scroll_end=False)
+                continue
+            show_source = self._show_original or row["translation"] is None
+            text = row["source"] if show_source else row["translation"]
+            # Direction follows the text being shown: source for originals,
+            # target for translations (fa → en must be left-justified).
+            lang = _merged_line_lang(row, show_source, self._target_lang)
+            # Untranslated sources stay dim until their translation arrives.
+            style = "dim italic" if show_source and row["translation"] is None else None
+            log.write(_make_text(text, style=style, lang=lang), scroll_end=False)
+        if self._merged_preview:
+            log.write(
+                _make_text(
+                    self._merged_preview,
+                    style="dim italic",
+                    lang=self._merged_preview_lang or "?",
+                ),
+                scroll_end=False,
+            )
+
+        # Writes above never auto-scroll: keep the reader's position unless
+        # they were following the live tail.
+        if was_at_end:
+            log.scroll_end(animate=False)
+        else:
+            try:
+                log.scroll_y = min(
+                    previous_scroll,
+                    max(0, log.virtual_size.height - log.size.height),
+                )
+            except Exception:
+                pass
+
     def action_clear(self) -> None:
         self.query_one("#source-log", RichLog).clear()
         self.query_one("#translation-log", RichLog).clear()
@@ -1234,6 +1454,10 @@ class PolyglotApp(App):
         self._row_count = 0
         self._last_source_text = ""
         self._sentence_buffer.clear()
+        self._merged_rows.clear()
+        self._merged_preview = None
+        if self._one_pane:
+            self._render_merged()
 
     async def action_focus_source(self) -> None:
         # PipeWire nodes and their indices churn, so rebuild before showing.
@@ -1278,10 +1502,19 @@ class PolyglotApp(App):
             if self._detected_lang != "?"
             else "detecting…"
         )
+        states = {
+            "listening": ("Listening", "status-listening"),
+            "speech": ("Speech", "status-listening"),
+            "transcribing": ("Transcribing", "status-loading"),
+            "committing": ("Committing", "status-loading"),
+        }
+        state_label, state_class = states.get(
+            self._pipeline_state, ("Listening", "status-listening")
+        )
         self._set_status(
-            f"● Listening — {device_name} — {lang_info} → {target_name}"
+            f"● {state_label} — {device_name} — {lang_info} → {target_name}"
             f" — {self._transcriber.backend_name if self._transcriber else 'CPU'}",
-            "status-listening",
+            state_class,
         )
 
     def _set_activity(
